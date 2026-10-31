@@ -1,0 +1,23 @@
+# pyramid-web — build-context exclusions.
+# The build context is pyramid-web/ (see docker-compose.yml `context: .`).
+# Keeping the context small speeds uploads and guarantees that stale local
+# artifacts (.venv, caches) can never leak into the images: both Dockerfiles
+# COPY explicit paths only, this file is the second line of defense.
+
+# Python virtualenvs are rebuilt inside the builder stage
+backend/.venv/
+**/.venv/
+
+# Bytecode / JIT caches
+**/__pycache__/
+**/*.pyc
+**/*.nbc
+
+# VCS / editor noise
+**/.git/
+**/.vscode/
+**/.idea/
+
+# Test/lint caches
+**/.pytest_cache/
+**/.ruff_cache/

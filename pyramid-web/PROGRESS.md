@@ -76,7 +76,7 @@ FastAPI backend wraps — already inside the interactivity budget.
 | 6 | Game modes & rulesets: 4 modes selectable in lobby UI; backend enforces Free/Combined/Dynamic/Classic (scores, turn switching, ball-in-hand, respotting); game state broadcast to all clients | DONE |
 | 7 | High-performance optimization: profile WebSocket traffic + physics; verify Numba compiling; client prediction/interpolation; UI must never show a blocking "Calculating shot..." screen | DONE |
 | 8 | UI polish & camera: current turn, timer, scores, remaining balls; responsive to all aspect ratios; smooth camera switching (player views vs spectator) | DONE |
-| 9 | Final validation: clean-machine Docker run; two browser tabs as a 2-player game; verify shot sync, rule enforcement, turn switching, game end; final `README.md` deployment guide | TODO |
+| 9 | Final validation: clean-machine Docker run; two browser tabs as a 2-player game; verify shot sync, rule enforcement, turn switching, game end; final `README.md` deployment guide | DONE |
 
 **Status legend:** `TODO` — not started · `IN_PROGRESS` — started but
 unfinished or blocked (Step Log entry must name the blocker) · `DONE` —
@@ -1195,3 +1195,236 @@ dev proxy doesn't run deflate, so the live WS check asserts it
 server-side only).
 
 Stopped. Awaiting `NEXT` → Step 9 (final validation).
+
+### Step 9 — Final validation & deployment package (DONE — MSK 2026-10-30, 22:35)
+
+> **Scope redefinition (user instruction, this turn):** the original step
+> description ("clean-machine Docker run; two browser tabs as a 2-player
+> game") is superseded — the user explicitly forbade running docker-compose
+> (no daemon / heavy virtualization in the sandbox) AND the two-tab browser
+> E2E (headless Chromium exhausted sandbox memory in Step 6; **no browser
+> runs of any kind**). Step 9 was therefore delivered as: multi-stage Docker
+> packaging + **static** verification of the whole deployment configuration,
+> plus the final README deployment guide. The runtime E2E (compose up, two
+> tabs, full-game walkthrough) now lives in the README as the user's own
+> acceptance run on their machine — every contract that run depends on is
+> verified statically here.
+
+Scope delivered: genuine MULTI-STAGE builds for both images (backend:
+builder venv → slim non-root runtime; frontend: a node `--check` syntax
+gate → nginx runtime — a parse error anywhere fails the image build before
+it ships), a `.dockerignore`, a production hardening pass on `nginx.conf`
+(gzip for JS/CSS/JSON, no-cache for first-party files, forwarded headers on
+both proxy paths), an 87-check static Docker verifier, and the final
+README deployment guide.
+
+Artifacts:
+
+- `docker/backend.Dockerfile` — rewritten as 2 stages:
+  `builder` (python:3.12-slim, venv at /opt/venv, pinned requirements — the
+  numpy/numba/llvmlite/scipy stack ships manylinux cp312 wheels so no
+  compiler toolchain needed) → `runtime` (same slim base, venv COPYed from
+  builder, libgomp1, **non-root `appuser`**, `PYTHONHASHSEED=0` +
+  `PATH=/opt/venv/bin`, app + vendored pooltool copied after the dep layer
+  so code edits don't bust the dependency cache, /app chowned to appuser so
+  numba's `.nbc` disk cache survives restarts, single-worker uvicorn CMD
+  without --reload, EXPOSE 8000).
+- `docker/frontend.Dockerfile` — rewritten as 2 stages:
+  `build` (node:22-alpine runs `node --check` on main.js / lobby.js /
+  ui_math.js — the same gate the local suite runs; Node 22 auto-detects ES
+  modules exactly like the browser) → `runtime` (nginx:1.27-alpine serving
+  the validated tree + nginx.conf as default.conf, EXPOSE 80).
+- `docker/nginx.conf` — production hardening (behavior-compatible):
+  `gzip on` with `gzip_types application/javascript text/css
+  application/json application/wasm image/svg+xml` + `gzip_vary` (the Step 7
+  profiling win applied to the REST path; WebSocket upgrade frames are
+  unaffected and permessage-deflate stays end-to-end browser↔uvicorn),
+  `X-Forwarded-Proto` on /api and `X-Real-IP`/`X-Forwarded-For` added on
+  /ws, `no-cache` on first-party files (`main|lobby|ui_math\.js` regex
+  location + `location = /index.html`) so rebuilds propagate instantly,
+  vendor/ stays at 1-day cache, SPA fallback unchanged.
+- `.dockerignore` (NEW) — excludes `.venv`, `__pycache__`, `*.pyc`,
+  `*.nbc`, `.git`, editor/test caches from the build context; both
+  Dockerfiles COPY explicit paths, this is the second line of defense.
+- `docker-compose.yml` — unchanged from Step 1 (it was already correct:
+  contexts/dockerfiles, `8000:8000` / `8080:80`, healthcheck on
+  `/api/health` with interval/retries/start_period, frontend
+  `depends_on: service_healthy`, restart policies, project name); the
+  verifier now locks every one of those keys in place.
+- `README.md` — full rewrite as the deployment guide: requirements
+  (Docker 24+, Compose v2, ports 8080/8000, ~1.5 GB disk), quickstart
+  (`docker compose up -d --build` → health poll → two tabs), how-to-play
+  (aim/power/ball-in-hand/«заказ»/cameras), ASCII architecture diagram,
+  keyframe+deflate performance notes, minimal-config table, a
+  troubleshooting table (cold warmup ~25 s, single worker, in-memory
+  rooms, `PYTHONHASHSEED`, port conflicts, Apple Silicon), dev-without-
+  Docker recipes, the 9-script verification suite table (265 checks), the
+  project tree, and physics provenance/licensing.
+- `scripts/verify_step9_docker.py` (NEW, ~470 lines, ruff-clean) — the
+  static acceptance suite: parses both Dockerfiles into logical
+  instructions, parses nginx.conf directives/braces, YAML-loads compose,
+  and cross-references every contract between the files (details below).
+
+Verification (all static; NO docker run, NO browser — per the user's
+explicit instruction this turn):
+
+```
+scripts/verify_step9_docker.py -> ALL 87 CHECKS PASSED:
+  A. files exist (compose, both Dockerfiles, nginx.conf, .dockerignore,
+     README)
+  B. compose: YAML dict; project name; exactly backend+frontend; build
+     context '.' + dockerfile paths resolve on disk; ports 8000:8000 /
+     8080:80; healthcheck hits /api/health with interval+retries+
+     start_period; frontend depends_on service_healthy; unless-stopped
+  C. backend.Dockerfile: exactly 2 FROM (python:3.12-slim AS builder →
+     python:3.12-slim); venv COPYed --from=builder; requirements.txt
+     copied BEFORE pip (cache), app AFTER; PYTHONHASHSEED=0; venv on
+     PATH; libgomp1; non-root USER; pooltool vendored in; single CMD
+     uvicorn 0.0.0.0:8000 without --reload/--workers; EXPOSE 8000
+  D. frontend.Dockerfile: exactly 2 FROM (node AS build →
+     nginx:1.27-alpine); the node --check gate covers all three first-
+     party JS files; nginx COPY --from=build; nginx.conf mounted;
+     EXPOSE 80; and the SAME gate re-run locally -> parses clean
+  E. nginx.conf: braces balanced; listen 80; root; /api/ →
+     http://backend:8000/api/; /ws → http://backend:8000/ws with
+     HTTP/1.1 + Upgrade + Connection upgrade + 3600s timeouts; vendor
+     cache 1d; try_files SPA fallback; gzip for JS/CSS/JSON; no-cache on
+     first-party JS + index.html; proxy host:port matches compose
+     service + EXPOSE
+  F. backend contracts: @app.get("/api/health") + @app.websocket("/ws")
+     exist in main.py (the routes the proxy targets); requirements.txt
+     pins fastapi/uvicorn[standard]/numpy/numba/llvmlite/scipy/msgpack/
+     PyYAML; the full pinned stack imports cleanly in-process; vendored
+     pooltool __init__ + ruleset/russian_pyramid.py + VENDORED.md shipped
+  G. frontend integrity: index.html's references (style.css, main.js,
+     lobby.js, vendor/three.module.js) all exist on disk at their exact
+     browser-resolved paths; three.module.js imports three.core.js and
+     that file ships; the importmap parses as JSON and every concrete
+     target exists; main.js's OrbitControls import resolves through the
+     importmap prefix map to an existing vendored file
+  H. .dockerignore: excludes .venv / __pycache__ / .git
+
+Static-checker bugs caught & fixed during development of the suite (the
+Docker artifacts themselves were correct on first write):
+  1. `listen 80;` shares its ';' chunk with the enclosing `server {`
+     opener — the check now anchors on line starts, not chunk starts
+  2. index.html's './vendor/three.module.js' was resolved relative to
+     frontend/ root instead of through its directory prefix
+  3. OrbitControls imports via the 'three/addons/' importmap prefix, not
+     a relative path — the suite now parses the importmap JSON and
+     resolves the specifier with real importmap semantics (longest
+     prefix wins); bare prefix entries ('three/addons/' -> './vendor/
+     jsm/') are skipped in the file-existence loop since concrete
+     resolutions through them are covered by the OrbitControls check
+
+Regression: verify_step8_ui.py --static -> ALL 47 CHECKS PASSED
+(no frontend/backend files touched this step; README/rewrite verified by
+the Step 9 suite's existence + content checks)
+uvx ruff check scripts/verify_step9_docker.py -> ALL CLEAN
+```
+
+Deliberately NOT done (per user instruction, recorded so no future session
+"completes" it in the sandbox): `docker compose up` on a clean machine and
+the two-tab browser E2E. The user runs those on their own host; README's
+Quickstart + Troubleshooting sections walk through exactly that, and every
+contract the run depends on (image wiring, ports, proxy targets, routes,
+healthcheck, cache headers, JIT warmup) is verified by the 87-check suite
+above. Combined project total across steps 0–9: **448 acceptance checks**,
+all green (65 Step 8 + 131 Step 5/6/7 regression + 87 Step 9 + the earlier
+steps' suites recorded in their entries).
+
+PROJECT COMPLETE — all steps 0–9 DONE. The deliverable is
+`download/pooltool_russian.zip` (workspace snapshot incl. this step) plus
+the in-tree deployment guide (`pyramid-web/README.md`).
+
+Stopped. Project finished — awaiting the user's final review.
+
+------------------------------------------------------------------------
+ADDENDUM — 2026-10-31 12:48 MSK: Deploy to render.com (user request)
+------------------------------------------------------------------------
+
+User asked: "how do I deploy to https://render.com/". The Step 9 Docker
+setup targets docker-compose on the user's own machine; render.com is a
+different runtime model (one web service, injected $PORT, no nginx in
+front). Made the project render-ready with four small additive changes
+plus one new artifact; the docker-compose path is untouched.
+
+Changes:
+
+- `backend/app/main.py` (VERSION 0.6.0 -> 0.7.0): when a frontend tree
+  is available ($PYRAMID_STATIC_DIR, else the repo's frontend/ next to
+  backend/), the same app now serves it at "/" (StaticFiles html=True)
+  with gzip (GZipMiddleware, minimum_size=1024) — one process exposes
+  UI + REST + WS on one origin, the single-container shape render.com
+  runs. The catch-all mount is registered AFTER every route so /api/*,
+  /docs and /ws keep precedence; with no frontend tree nothing is
+  mounted (pure-API mode, prior behavior unchanged for tests/dev).
+- `docker/backend.Dockerfile`: `COPY frontend ./static` + ENV
+  `PYRAMID_STATIC_DIR=/app/static` (COPY happens before the chown layer,
+  so numba's writable-cache guarantee still holds); CMD switched to
+  shell form `--port "${PORT:-8000}"` — render.com injects PORT
+  (default 10000) and requires the service to bind to it, while
+  docker-compose (no PORT set) still binds 8000 and its healthcheck
+  URL is unchanged. Non-root USER, single worker, no --reload: all
+  preserved.
+- `frontend/lobby.js`: WS keepalive — every 55 s an in-room
+  {"type":"ping"} (server already replies pong; the client dispatcher
+  ignores pong via its default case). Reason: render.com spins a Free
+  service down after 15 minutes with no inbound HTTP request AND no
+  WebSocket message, so a quiet open socket would sleep mid-game; the
+  ping also defeats NAT/proxy idle drops everywhere else.
+- `render.yaml` (NEW): Blueprint — one web service, runtime docker,
+  plan free, dockerfilePath ./docker/backend.Dockerfile, dockerContext
+  '.', healthCheckPath /api/health, autoDeployTrigger commit (current
+  spec keys verified against render.com docs: 'env'/'autoDeploy' are
+  the deprecated names).
+- `README.md`: new "Deploy to render.com" section (git push recipe,
+  Blueprint path, manual Web Service path, free-tier behavior table:
+  15-min spin-down / ~1 min wake-up / in-memory rooms wiped on sleep /
+  512 MB / 750 instance-hours per month / bandwidth + build-minute
+  allowances), a $PORT row in the config table, a single-container
+  note in Architecture, an extra troubleshooting row, and the project
+  layout + verification-suite tables updated.
+- `scripts/verify_step9_docker.py`: CMD contract updated for the shell
+  form (0.0.0.0 + ${PORT:-8000}, still single worker, no --reload) and
+  two new image-contract checks (frontend copied, PYRAMID_STATIC_DIR) —
+  87 -> 89 checks, all green.
+
+Verification (static + live; NO docker run, NO browser — standing rule):
+
+- `scripts/verify_render_deploy.py` (NEW) -> ALL 57 CHECKS (46 static +
+  11 live): Blueprint spec keys; Dockerfile single-container contract
+  (UI copied before chown, PYRAMID_STATIC_DIR, ${PORT:-8000} CMD, no
+  --reload/--workers); main.py mount-after-routes + html=True + gzip;
+  keepalive wiring (55 s, started on open, stopped on close/reset,
+  node --check); README anchors; compose unchanged. LIVE: booted
+  uvicorn on :8100 with PYRAMID_STATIC_DIR and proved GET / serves the
+  real UI (importmap + canvas markers), /style.css /main.js /lobby.js
+  /vendor/three.module.js -> 200, Accept-Encoding: gzip ->
+  content-encoding: gzip, /docs -> 200 (route precedence over the
+  catch-all), /definitely-missing -> 404, and on the same origin WS
+  create -> joined (4-letter room) + ping -> pong.
+- Full regression battery (`scripts/regress_render_addendum.sh`, NEW):
+  step5 keyframes (18) + step6 rules (44) + step7 numba (5) in-process,
+  then ONE warmed uvicorn on :8100 for step5 ws (18) + step6 ws (27) +
+  step8 ui --live (18), then the render suite's own live run —
+  REGRESSION BATTERY: ALL SUITES PASSED.
+- `verify_step9_docker.py` -> 89/89. `verify_step8_ui.py --static` ->
+  47/47. `uvx ruff` clean on all touched python files.
+- Two verifier bugs found and fixed during the run (the deployment
+  artifacts themselves were correct on first write): (1) the gzip
+  assertion looked up the Content-Encoding header case-sensitively
+  while Starlette sends lowercase field names; (2) the WS probe pinged
+  before the create handshake — the protocol (like the real client,
+  which pings only in-room 55 s after open) rejects that with
+  invalid_message.
+- Sandbox recovery note: the live workspace was wiped again between
+  sessions (including the previous zip); the tree was restored from
+  the /tmp/my-project snapshot and the pinned requirements
+  reinstalled into the venv before verifying.
+
+Session check total: 57 + 89 + 47 + 18 + 44 + 5 + 18 + 27 + 18 = 323
+acceptance checks green. Deliverable: download/pooltool_russian.zip
+refreshed below (workspace snapshot incl. this addendum).
+
+Stopped — awaiting the user's review / render.com deploy attempt.

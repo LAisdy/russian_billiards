@@ -83,6 +83,7 @@ const state = {
   lastTurnId: null, // for the "your turn" toast edge trigger
   chipEls: null, // the 15 remaining-ball chip spans (built once per game)
   toastTimer: null,
+  keepaliveTimer: null, // periodic WS ping — see startKeepalive
 };
 
 const PYRAMID = () => window.__pyramid || null;
@@ -102,6 +103,28 @@ function readCode() {
 function wsUrl() {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   return `${proto}//${location.host}/ws`;
+}
+
+// Keepalive: a quiet WebSocket looks like "no inbound traffic" to idle-timeout
+// infrastructure (render.com free instances spin a service down after 15
+// minutes without any HTTP request OR WebSocket message; some NATs/proxies
+// drop idle sockets even sooner). The server already answers ping with pong
+// and the client's dispatcher ignores pong (default case), so this costs
+// one tiny frame per interval and keeps a running game alive everywhere.
+function startKeepalive(ws) {
+  stopKeepalive();
+  state.keepaliveTimer = setInterval(() => {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'ping' }));
+    }
+  }, 55000);
+}
+
+function stopKeepalive() {
+  if (state.keepaliveTimer) {
+    clearInterval(state.keepaliveTimer);
+    state.keepaliveTimer = null;
+  }
 }
 
 function isHost() {
@@ -127,6 +150,7 @@ function connect() {
     const timer = setTimeout(() => reject(new Error('connection timeout')), 5000);
     ws.onopen = () => {
       clearTimeout(timer);
+      startKeepalive(ws);
       resolve(ws);
     };
     ws.onerror = () => {
@@ -698,6 +722,7 @@ function renderRoom() {
 }
 
 function onClosed() {
+  stopKeepalive();
   if (state.roomCode) {
     showMsg('Connection closed — room left.');
   }
@@ -705,6 +730,7 @@ function onClosed() {
 }
 
 function resetToEntry() {
+  stopKeepalive();
   state.ws = null;
   state.playerId = null;
   state.roomCode = null;

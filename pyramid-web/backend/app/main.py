@@ -37,20 +37,34 @@ Step 8: UI polish & camera — every game snapshot additionally carries the
         not enforce one); the client renders the HUD bar (scores, turn,
         remaining-ball chips), camera presets with smooth tweens, and
         aspect-ratio-responsive layout.
+Deployment addendum: single-container hosting (render.com) — when a
+        frontend tree is available (``PYRAMID_STATIC_DIR`` env var, or the
+        repo's ``frontend/`` next to ``backend/``), it is served by this
+        same app at ``/`` (``html=True``) with gzip compression, so one
+        process exposes UI + REST + WebSocket on one origin. All /api and
+        /ws routes are registered before the mount and keep precedence;
+        when no frontend tree exists (pure-API deployments) nothing is
+        mounted and behavior is unchanged.
 
 Run (dev):  uvicorn app.main:app --host 127.0.0.1 --port 8100
 Run (docker): see docker/backend.Dockerfile
+Run (single container, e.g. render.com): the backend image ships the
+        frontend and honors Render's ``$PORT`` (see the Dockerfile CMD)
 """
 
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
+from starlette.middleware.gzip import GZipMiddleware
 
 from . import physics, rules
 from .lobby import LobbyError, Session, manager
@@ -59,7 +73,7 @@ from .physics import PhysicsError
 logger = logging.getLogger(__name__)
 
 APP_NAME = "pyramid-web-backend"
-VERSION = "0.6.0"
+VERSION = "0.7.0"
 
 
 @asynccontextmanager
@@ -327,3 +341,44 @@ async def ws_endpoint(ws: WebSocket) -> None:
     finally:
         if session is not None:
             await manager.leave(session)
+
+
+# --- single-container static hosting (deployment addendum) ----------------------
+#
+# This mount is registered LAST on purpose: Starlette matches routes in
+# registration order, so every /api/*, /docs and /ws route above keeps
+# precedence and the catch-all below only answers what they did not.
+#
+# Frontend directory resolution:
+#   1. $PYRAMID_STATIC_DIR (what the backend Docker image sets to the
+#      copied-in UI tree — the render.com deployment path),
+#   2. the repo's frontend/ next to backend/ (a plain checkout:
+#      ``uvicorn app.main:app`` from backend/ then serves the UI too),
+#   3. nothing — pure-API mode, exactly as before this addendum.
+
+
+def _resolve_frontend_dir() -> Path | None:
+    """Locate a servable frontend tree (must contain index.html)."""
+    candidates: list[Path] = []
+    env_dir = os.environ.get("PYRAMID_STATIC_DIR", "").strip()
+    if env_dir:
+        candidates.append(Path(env_dir))
+    # backend/app/main.py -> backend/ -> pyramid-web/frontend
+    candidates.append(Path(__file__).resolve().parent.parent.parent / "frontend")
+    for cand in candidates:
+        if cand.is_dir() and (cand / "index.html").is_file():
+            return cand
+    return None
+
+
+_frontend = _resolve_frontend_dir()
+if _frontend is not None:
+    # gzip matters in this mode: the vendored three.module.js is ~1.2 MB raw
+    # and the docker-compose nginx path (which gzips it) is not in front of
+    # the app here. REST/WS traffic is unaffected (WS frames ignore HTTP
+    # middleware; permessage-deflate stays end-to-end).
+    app.add_middleware(GZipMiddleware, minimum_size=1024)
+    app.mount("/", StaticFiles(directory=_frontend, html=True), name="frontend")
+    logger.info("serving frontend from %s at /", _frontend)
+else:
+    logger.info("no frontend tree found — pure-API mode (no static mount)")

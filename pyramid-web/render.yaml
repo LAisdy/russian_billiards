@@ -1,0 +1,29 @@
+# Render.com Blueprint — the whole game as ONE web service.
+#
+# The backend image (docker/backend.Dockerfile) ships the frontend UI and
+# serves it at "/" alongside /api and /ws, so a single Render web service is
+# the full game: open https://<service>.onrender.com in two tabs/devices and
+# play. WebSockets (wss://) are terminated by Render automatically.
+#
+# Deploy (Blueprint): push this repo to GitHub/GitLab, then on
+# https://dashboard.render.com choose New + -> Blueprint and pick the repo —
+# Render reads this file and pre-fills everything below.
+# Deploy (manual): New + -> Web Service -> same repo -> Runtime "Docker";
+# the fields below map 1:1 to the dashboard form (see README "Deploy to
+# render.com").
+#
+# Spec reference: https://render.com/docs/blueprint-spec
+
+services:
+  - type: web
+    name: pyramid-web
+    runtime: docker # the backend multi-stage image (uvicorn + vendored pooltool)
+    plan: free # 512 MB, 750 free instance hours/month, spins down when idle
+    dockerfilePath: ./docker/backend.Dockerfile
+    dockerContext: .
+    healthCheckPath: /api/health # gates zero-downtime deploys; also the HUD probe
+    autoDeployTrigger: commit # redeploy on every push to the selected branch
+    # The image CMD honors Render's $PORT (default 10000), so no Docker
+    # Command override is needed. No env vars, databases or disks are
+    # required: rooms live in process memory and numba caches inside the
+    # image layer.
