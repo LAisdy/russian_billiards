@@ -1,0 +1,30 @@
+{
+  "source_repo": "/home/z/my-project/pooltool",
+  "source_version": "0.6.0",
+  "source_commit": "7632b1c66f19159741a4cfe48b23d18f079d9a87",
+  "vendored_at": "2026-10-30T12:51:20Z",
+  "copied_verbatim": 119,
+  "patched_files": [
+    "utils/__init__.py"
+  ],
+  "replaced_files": [
+    "__init__.py",
+    "ani/__init__.py",
+    "ani/constants.py",
+    "config/__init__.py",
+    "system/__init__.py"
+  ],
+  "excluded_files": [
+    "interact.py",
+    "main.py",
+    "objects/ball/render.py",
+    "objects/cue/render.py",
+    "objects/table/render.py",
+    "system/render.py"
+  ],
+  "excluded_dirs": [
+    "ani",
+    "logo",
+    "models"
+  ]
+}

@@ -1,0 +1,53 @@
+from abc import ABC, abstractmethod
+from typing import Protocol
+
+from pooltool.objects.ball.datatypes import Ball
+
+
+def bounce_height(vz: float, g: float) -> float:
+    """Return how high a ball with outgoing positive z-velocity will bounce.
+
+    Measured as distance from table to bottom of ball.
+    """
+    return 0.5 * vz**2 / g
+
+
+class _BaseStrategy(Protocol):
+    def resolve(self, ball: Ball, inplace: bool = False) -> Ball: ...
+
+    def make_kiss(self, ball: Ball) -> Ball: ...
+
+
+class BallTableCollisionStrategy(_BaseStrategy, Protocol):
+    """Ball-table collision models must satisfy this protocol.
+
+    Unlike the other resolver-strategy protocols, this one does not declare a
+    ``dim`` attribute.
+    """
+
+    def solve(self, ball: Ball) -> Ball:
+        """Resolves a ball-table collision"""
+        ...
+
+
+class CoreBallTableCollision(ABC):
+    """Operations used by every ball-table collision resolver"""
+
+    def make_kiss(self, ball: Ball) -> Ball:
+        """Translate the ball so its height is exactly its radius.
+
+        If the ball is not at a height R, it is moved vertically such that it is.
+        """
+        ball.state.rvw[0, 2] = ball.params.R
+        return ball
+
+    def resolve(self, ball: Ball, inplace: bool = False) -> Ball:
+        if not inplace:
+            ball = ball.copy()
+
+        ball = self.make_kiss(ball)
+        return self.solve(ball)
+
+    @abstractmethod
+    def solve(self, ball: Ball) -> Ball:
+        pass

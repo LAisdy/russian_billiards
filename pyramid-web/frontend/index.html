@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>pyramid-web — Russian Pyramid</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='13' fill='%237a1417'/%3E%3Ccircle cx='16' cy='16' r='6' fill='%23f2f0e8'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="style.css">
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "./vendor/three.module.js",
+      "three/addons/": "./vendor/jsm/"
+    }
+  }
+  </script>
+</head>
+<body>
+  <canvas id="scene"></canvas>
+
+  <div id="hud">
+    <div id="hud-title">pyramid-web · Russian Pyramid</div>
+    <div class="hud-line" id="hud-three">three.js: loading…</div>
+    <div class="hud-line" id="hud-backend">backend: checking…</div>
+    <div class="hud-line" id="hud-table">table: loading rack…</div>
+  </div>
+
+  <!-- Step 8: game HUD bar — status only; the side panel keeps the controls -->
+  <div id="gamehud" hidden>
+    <div class="ghud-block" id="ghud-gameinfo">
+      <div id="ghud-mode">—</div>
+      <div id="ghud-shot" class="ghud-sub"></div>
+    </div>
+    <div class="ghud-block" id="ghud-players"></div>
+    <div class="ghud-block" id="ghud-status">
+      <div id="ghud-turn"></div>
+      <div id="ghud-clock" class="ghud-sub" title="Thinking time for the upcoming stroke (informational)"></div>
+    </div>
+    <div class="ghud-block" id="ghud-balls"></div>
+    <div class="ghud-block" id="ghud-cams" title="Camera views (keys 1–4)"></div>
+  </div>
+
+  <!-- Step 8: transient "your turn" toast -->
+  <div id="turn-toast" hidden>Your turn</div>
+
+  <div id="lobby">
+    <div class="lobby-panel">
+      <div class="lobby-title">pyramid-web</div>
+      <div class="lobby-sub">Russian Pyramid · multiplayer</div>
+
+      <div id="lobby-entry">
+        <label class="lobby-label" for="lobby-name">Your name</label>
+        <input id="lobby-name" maxlength="24" placeholder="Player" autocomplete="off">
+
+        <button id="btn-create" class="lobby-btn">Create room</button>
+
+        <div class="lobby-or">— or join with a code —</div>
+
+        <label class="lobby-label" for="lobby-code">Room code</label>
+        <input id="lobby-code" maxlength="4" placeholder="ABCD" autocomplete="off" spellcheck="false">
+
+        <button id="btn-join" class="lobby-btn lobby-btn-secondary">Join room</button>
+      </div>
+
+      <div id="lobby-room" hidden>
+        <div class="lobby-code-label">Room code</div>
+        <div id="lobby-code-display">----</div>
+        <ul id="lobby-players"></ul>
+
+        <div class="lobby-label">Game mode</div>
+        <div id="mode-grid">
+          <button type="button" class="mode-btn" data-mode="free">
+            <span class="mode-name">Free</span>
+            <span class="mode-ru">«Свободная»</span>
+            <span class="mode-target">race to 8</span>
+          </button>
+          <button type="button" class="mode-btn" data-mode="combined">
+            <span class="mode-name">Combined</span>
+            <span class="mode-ru">«Комбинированная»</span>
+            <span class="mode-target">race to 8</span>
+          </button>
+          <button type="button" class="mode-btn" data-mode="dynamic">
+            <span class="mode-name">Dynamic</span>
+            <span class="mode-ru">«Динамичная»</span>
+            <span class="mode-target">race to 8</span>
+          </button>
+          <button type="button" class="mode-btn" data-mode="classic">
+            <span class="mode-name">Classic</span>
+            <span class="mode-ru">«Классическая»</span>
+            <span class="mode-target">race to 71</span>
+          </button>
+        </div>
+        <div id="mode-note"></div>
+
+        <button id="btn-start" class="lobby-btn">Start game</button>
+        <div id="lobby-hint"></div>
+      </div>
+
+      <div id="lobby-game" hidden>
+        <div id="panel-head">
+          <span class="lobby-code-label">Game</span>
+          <button type="button" id="btn-panel-toggle" title="Collapse / expand controls" aria-label="Collapse controls">▾</button>
+        </div>
+        <div id="panel-body">
+          <div id="lobby-game-text"></div>
+          <div id="game-controls">
+            <div id="call-row" hidden>
+              <label class="lobby-label" for="call-ball">Called shot («заказ»)</label>
+              <select id="call-ball"></select>
+              <label class="lobby-label" for="call-pocket">into pocket</label>
+              <select id="call-pocket">
+                <option value="lb">top-left corner</option>
+                <option value="lc">top-middle</option>
+                <option value="lt">top-right corner</option>
+                <option value="rb">bottom-left corner</option>
+                <option value="rc">bottom-middle</option>
+                <option value="rt">bottom-right corner</option>
+              </select>
+            </div>
+            <label class="lobby-label" for="power">
+              Power <span id="power-val">45%</span>
+            </label>
+            <input type="range" id="power" min="1" max="100" value="45">
+            <button id="btn-shoot" class="lobby-btn">Shoot</button>
+            <button id="btn-place-cue" class="lobby-btn lobby-btn-secondary" hidden>
+              Placing cue ball: on
+            </button>
+            <div id="game-hint">Click the table to aim, then shoot.</div>
+          </div>
+          <div id="game-over" hidden>
+            <div id="game-over-text"></div>
+            <button id="btn-rematch" class="lobby-btn" hidden>Rematch</button>
+          </div>
+        </div>
+      </div>
+
+      <div id="lobby-msg" class="lobby-msg"></div>
+    </div>
+  </div>
+
+  <script type="module" src="main.js"></script>
+  <script type="module" src="lobby.js"></script>
+</body>
+</html>

@@ -1,0 +1,309 @@
+import numpy as np
+from numba import jit
+from numpy.typing import NDArray
+
+import pooltool.constants as const
+from pooltool.ptmath.roots import quadratic
+from pooltool.ptmath.utils import (
+    coordinate_rotation,
+    cross,
+    norm2d,
+    norm3d,
+    unit_vector,
+)
+
+
+@jit(nopython=True, cache=const.use_numba_cache)
+def surface_velocity_vw(
+    v: NDArray[np.float64], w: NDArray[np.float64], d: NDArray[np.float64], R: float
+) -> NDArray[np.float64]:
+    """Velocity of a point on the ball's surface.
+
+    ``d`` is a unit direction from the ball's center, and the point in question is
+    where that direction meets the surface. Its velocity is the ball's translational
+    velocity plus the rigid-body rotation term:
+
+        v + w x (R d)
+
+    This includes any component along ``d``, i.e. motion of the point into or away
+    from whatever it is touching. For the sliding component alone, see
+    :func:`tangent_surface_velocity_vw`.
+
+    Args:
+        v: Translational velocity of the ball's center.
+        w: Angular velocity of the ball.
+        d: Unit vector from the ball's center to the surface point.
+        R: Ball radius.
+
+    Returns:
+        NDArray[np.float64]:
+            Velocity of the surface point.
+    """
+    return v + cross(w, R * d)
+
+
+@jit(nopython=True, cache=const.use_numba_cache)
+def surface_velocity(
+    rvw: NDArray[np.float64], d: NDArray[np.float64], R: float
+) -> NDArray[np.float64]:
+    """Velocity of a point on the ball's surface, from the ball's kinematic state.
+
+    Unpacks ``v`` and ``w`` from ``rvw`` and delegates to
+    :func:`surface_velocity_vw`.
+
+    Args:
+        rvw: Kinematic state of the ball. See :class:`pooltool.objects.BallState`.
+        d: Unit vector from the ball's center to the surface point.
+        R: Ball radius.
+
+    Returns:
+        NDArray[np.float64]:
+            Velocity of the surface point.
+    """
+    _, v, w = rvw
+    return surface_velocity_vw(v, w, d, R)
+
+
+@jit(nopython=True, cache=const.use_numba_cache)
+def tangent_surface_velocity_vw(
+    v: NDArray[np.float64], w: NDArray[np.float64], d: NDArray[np.float64], R: float
+) -> NDArray[np.float64]:
+    """Velocity of a point on the ball's surface, projected onto the tangent plane.
+
+    Same as :func:`surface_velocity_vw` but with the component of ``v`` along ``d``
+    removed first:
+
+        (v - (v . d) d) + w x (R d)
+
+    The rotation term is already perpendicular to ``d``, so the result lies entirely
+    in the plane tangent to the surface at the point. This is the velocity with
+    which the surface point slides across a contacting body, with the approach or
+    separation speed along ``d`` discarded. It is the quantity that contact friction
+    acts on.
+
+    Args:
+        v: Translational velocity of the ball's center.
+        w: Angular velocity of the ball.
+        d: Unit vector from the ball's center to the surface point.
+        R: Ball radius.
+
+    Returns:
+        NDArray[np.float64]:
+            Tangential velocity of the surface point.
+    """
+    v_t = v - np.sum(v * d) * d
+    return v_t + cross(w, R * d)
+
+
+@jit(nopython=True, cache=const.use_numba_cache)
+def tangent_surface_velocity(
+    rvw: NDArray[np.float64], d: NDArray[np.float64], R: float
+) -> NDArray[np.float64]:
+    """Tangential velocity of a surface point, from the ball's kinematic state.
+
+    Unpacks ``v`` and ``w`` from ``rvw`` and delegates to
+    :func:`tangent_surface_velocity_vw`.
+
+    Args:
+        rvw: Kinematic state of the ball. See :class:`pooltool.objects.BallState`.
+        d: Unit vector from the ball's center to the surface point.
+        R: Ball radius.
+
+    Returns:
+        NDArray[np.float64]:
+            Tangential velocity of the surface point.
+    """
+    _, v, w = rvw
+    return tangent_surface_velocity_vw(v, w, d, R)
+
+
+@jit(nopython=True, cache=const.use_numba_cache)
+def rel_velocity(rvw: NDArray[np.float64], R: float) -> NDArray[np.float64]:
+    """Compute velocity of ball's point of contact with the cloth relative to the cloth
+
+    This vector is non-zero whenever the ball is sliding.
+
+    Note:
+        - This is just the :func:`surface_velocity` called with ``d=[0,0,-1]``.
+    """
+    return surface_velocity(rvw, np.array([0.0, 0.0, -1.0], dtype=np.float64), R)
+
+
+@jit(nopython=True, cache=const.use_numba_cache)
+def get_u_vec(
+    rvw: NDArray[np.float64], R: float, phi: float, s: int
+) -> NDArray[np.float64]:
+    if s == const.rolling:
+        return np.array([1, 0, 0], dtype=np.float64)
+
+    rel_vel = rel_velocity(rvw, R)
+    if (rel_vel == 0).all():
+        return np.array([1, 0, 0], dtype=np.float64)
+
+    return coordinate_rotation(unit_vector(rel_vel), -phi)
+
+
+@jit(nopython=True, cache=const.use_numba_cache)
+def on_table(rvw: NDArray[np.float64], R: float) -> bool:
+    """True when the ball's center is at the table-plane height (z == R)."""
+    return rvw[0, 2] == R
+
+
+@jit(nopython=True, cache=const.use_numba_cache)
+def final_ball_motion_state(rvw: NDArray[np.float64], R: float) -> int:
+    """Classify a ball's motion state from its kinematics after a collision.
+
+    Collision resolvers produce a new kinematic state and need a motion state label to
+    accompany it. This assigns one from the kinematics alone: a ball below the table
+    plane is pocketed; a ball above it, or with any vertical velocity, is airborne; a
+    ball on the plane is sliding if its contact point moves relative to the cloth,
+    rolling if it translates without slipping, spinning if it only rotates about the
+    vertical, and stationary otherwise. Speeds at or below ``EPS`` count as zero.
+
+    For a ball on the table the answer is nearly always sliding, since an impulse
+    changes its velocity without matching its rotation. The other labels arise only
+    when the collision leaves the ball with no motion at all, e.g. an ideal stop shot.
+
+    This is not the transition machinery. Collision-less changes of motion state as a
+    ball decelerates are detected and resolved by
+    :mod:`pooltool.physics.resolve.transition`.
+
+    Args:
+        rvw: Kinematic state of the ball. See :class:`pooltool.objects.BallState`.
+        R: Ball radius.
+
+    Returns:
+        int:
+            One of the motion state labels in :mod:`pooltool.constants`.
+    """
+    if rvw[0, 2] < 0:
+        return const.pocketed
+
+    if rvw[1, 2] != 0.0 or not on_table(rvw, R):
+        return const.airborne
+
+    if norm3d(rel_velocity(rvw, R)) > const.EPS:
+        return const.sliding
+
+    if norm2d(rvw[1]) > const.EPS:
+        return const.rolling
+
+    if abs(rvw[2, 2]) > const.EPS:
+        return const.spinning
+
+    return const.stationary
+
+
+@jit(nopython=True, cache=const.use_numba_cache)
+def get_airborne_time(rvw: NDArray[np.float64], R: float, g: float) -> float:
+    """Time until an airborne ball's bottom touches the table plane (z = R).
+
+    Solves ``-0.5 * g * t**2 + v_z * t + (z - R) = 0`` and returns the later root
+    (the descending-leg intersection). Returns ``np.inf`` when gravity is zero.
+    """
+    if g == 0.0:
+        return np.inf
+
+    t1, t2 = quadratic.solve(-0.5 * g, rvw[1, 2], rvw[0, 2] - R)
+    return max(t1.real, t2.real)
+
+
+@jit(nopython=True, cache=const.use_numba_cache)
+def get_slide_time(rvw: NDArray[np.float64], R: float, u_s: float, g: float) -> float:
+    if u_s == 0.0:
+        return np.inf
+
+    return 2 * norm3d(rel_velocity(rvw, R)) / (7 * u_s * g)
+
+
+@jit(nopython=True, cache=const.use_numba_cache)
+def get_roll_time(rvw: NDArray[np.float64], u_r: float, g: float) -> float:
+    if u_r == 0.0:
+        return np.inf
+
+    _, v, _ = rvw
+    return norm3d(v) / (u_r * g)
+
+
+@jit(nopython=True, cache=const.use_numba_cache)
+def get_spin_time(rvw: NDArray[np.float64], R: float, u_sp: float, g: float) -> float:
+    if u_sp == 0.0:
+        return np.inf
+
+    _, _, w = rvw
+    return np.abs(w[2]) * 2 / 5 * R / u_sp / g
+
+
+def get_ball_energy(rvw: NDArray[np.float64], R: float, m: float, g: float) -> float:
+    """Get the energy of a ball.
+
+    Sum of linear kinetic, rotational kinetic, and gravitational potential energy.
+    Potential energy is defined relative to a ball at rest on the table (``z = R``),
+    so a ball sitting on the table contributes zero energy.
+    """
+    LKE = m * norm3d(rvw[1]) ** 2 / 2
+    RKE = (2 / 5 * m * R**2) * norm3d(rvw[2]) ** 2 / 2
+    PE = m * g * (rvw[0, 2] - R)
+
+    return LKE + RKE + PE
+
+
+@jit(nopython=True, cache=const.use_numba_cache)
+def tip_contact_offset(
+    cue_center_offset: NDArray[np.float64], tip_radius: float, ball_radius: float
+) -> NDArray[np.float64]:
+    """Calculate the ball contact point offset from the cue tip center offset.
+
+    This function converts the offset of the cue tip's center (relative to the ball's center,
+    and normalized by the ball's radius) into the offset of the contact point on the ball's surface.
+
+    The conversion is based on the geometry of two circles in contact. Since the distance from the
+    ball's center to the cue tip's center is (ball_radius + tip_radius) while the ball's surface is
+    at a distance ball_radius, the contact point lies along the same line scaled by the factor
+
+        1 / (1 + tip_radius/ball_radius).
+
+    In other words, if (a, b) represent the cue tip center offset, then the ball is struck at
+
+        (a, b) / (1 + tip_radius/ball_radius).
+
+    Args:
+        cue_center_offset:
+            A 2D vector (e.g., [a, b]) representing the offset of the cue tip center
+            relative to the ball center (normalized by the ball's radius).
+        tip_radius: The radius of the cue tip.
+        ball_radius: The radius of the ball.
+
+    Returns:
+        NDArray[np.float64]:
+            A 2D vector representing the offset of the contact point on the ball's
+            surface, normalized by the ball's radius.
+    """
+    return cue_center_offset / (1 + tip_radius / ball_radius)
+
+
+@jit(nopython=True, cache=const.use_numba_cache)
+def tip_center_offset(
+    tip_center_offset: NDArray[np.float64], tip_radius: float, ball_radius: float
+) -> NDArray[np.float64]:
+    """Calculate the cue tip center offset from a given contact point offset on the ball.
+
+    This function performs the inverse transformation of `tip_contact_offset`. Given a 2D contact point
+    offset on the ball’s surface (normalized by the ball's radius), it computes the corresponding cue tip
+    center offset. Since the cue tip’s center is located an extra tip_radius beyond the ball’s surface,
+    the transformation scales the contact offset by
+
+        1 + tip_radius/ball_radius.
+
+    Args:
+        cue_center_offset:
+            A 2D vector (e.g., [a, b]) representing the offset of the cue tip center
+            relative to the ball center (normalized by the ball's radius).
+        tip_radius: The radius of the cue tip.
+        ball_radius: The radius of the ball.
+
+    Returns:
+        NDArray[np.float64]: A 2D vector representing the offset of the cue tip's center relative to the
+            ball's center (normalized by the ball's radius).
+    """
+    return tip_center_offset * (1 + tip_radius / ball_radius)

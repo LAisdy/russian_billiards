@@ -1,0 +1,42 @@
+{
+  "free": {
+    "physics_ms": 144.482,
+    "evaluate_break_us": 54.66,
+    "evaluate_mid_us": 121.74,
+    "process_us": 250.56,
+    "construct_us": 4.83,
+    "events": 158,
+    "potted": 0,
+    "ruleset_share_pct": 0.17
+  },
+  "combined": {
+    "physics_ms": 105.435,
+    "evaluate_break_us": 47.45,
+    "evaluate_mid_us": 136.55,
+    "process_us": 234.63,
+    "construct_us": 4.82,
+    "events": 110,
+    "potted": 0,
+    "ruleset_share_pct": 0.218
+  },
+  "dynamic": {
+    "physics_ms": 108.382,
+    "evaluate_break_us": 48.25,
+    "evaluate_mid_us": 113.84,
+    "process_us": 237.89,
+    "construct_us": 4.9,
+    "events": 117,
+    "potted": 0,
+    "ruleset_share_pct": 0.215
+  },
+  "classic": {
+    "physics_ms": 121.39,
+    "evaluate_break_us": 70.43,
+    "evaluate_mid_us": 140.49,
+    "process_us": 261.99,
+    "construct_us": 4.91,
+    "events": 129,
+    "potted": 0,
+    "ruleset_share_pct": 0.212
+  }
+}

@@ -1,0 +1,156 @@
+import attrs
+import numpy as np
+from numba import jit
+
+import pooltool.constants as const
+import pooltool.ptmath as ptmath
+from pooltool.objects.ball.datatypes import Ball
+from pooltool.physics.dimensionality import Dim
+from pooltool.physics.resolve.ball_ball.core import CoreBallBallCollision
+from pooltool.physics.resolve.ball_ball.friction import (
+    AlciatoreBallBallFriction,
+    BallBallFrictionStrategy,
+)
+from pooltool.physics.resolve.models import BallBallModel
+from pooltool.physics.utils import final_ball_motion_state, surface_velocity_vw
+
+
+def _resolve_ball_ball(rvw1, rvw2, R, u_b, e_b):
+    unit_x = np.array([1.0, 0.0, 0.0])
+    delta_centers = rvw2[0] - rvw1[0]
+    frame_rotation = ptmath.rotation_matrix_from_vector_to_vector(delta_centers, unit_x)
+    v1_prime, w1_prime = ptmath.rotate_vectors(frame_rotation, rvw1[1:3])
+    v2_prime, w2_prime = ptmath.rotate_vectors(frame_rotation, rvw2[1:3])
+    v1_prime, w1_prime, v2_prime, w2_prime = _resolve_ball_ball_x_normal(
+        v1_prime, w1_prime, v2_prime, w2_prime, R, u_b, e_b
+    )
+    rvw1[1:3] = ptmath.rotate_vectors(frame_rotation.T, np.array([v1_prime, w1_prime]))
+    rvw2[1:3] = ptmath.rotate_vectors(frame_rotation.T, np.array([v2_prime, w2_prime]))
+    return rvw1, rvw2
+
+
+@jit(nopython=True, cache=const.use_numba_cache)
+def _resolve_ball_ball_x_normal(v1, w1, v2, w2, R, u_b, e_b):
+    unit_x = np.array([1.0, 0.0, 0.0])
+
+    # velocity normal component, same for both slip and no-slip after collision cases
+    v1_n_f = 0.5 * ((1.0 - e_b) * v1[0] + (1.0 + e_b) * v2[0])
+    v2_n_f = 0.5 * ((1.0 + e_b) * v1[0] + (1.0 - e_b) * v2[0])
+    D_v_n_magnitude = abs(v2_n_f - v1_n_f)
+
+    # angular velocity normal component, unchanged
+    w1_n_f = w1[0]
+    w2_n_f = w2[0]
+
+    # discard velocity normal components for now
+    v1[0] = 0.0
+    v2[0] = 0.0
+    w1[0] = 0.0
+    w2[0] = 0.0
+    v1_f = v1.copy()
+    w1_f = w1.copy()
+    v2_f = v2.copy()
+    w2_f = w2.copy()
+
+    v1_c = surface_velocity_vw(v1, w1, unit_x, R)
+    v2_c = surface_velocity_vw(v2, w2, -unit_x, R)
+    v12_c = v1_c - v2_c
+    has_relative_velocity = ptmath.norm3d(v12_c) > const.EPS
+
+    # if there is no relative surface velocity to begin with,
+    # don't bother calculating slip condition
+    if has_relative_velocity:
+        # tangent components for slip condition
+        v12_c_hat = ptmath.unit_vector(v12_c)
+        D_v1_t = u_b * D_v_n_magnitude * -v12_c_hat
+        D_w1 = 2.5 / R * ptmath.cross(unit_x, D_v1_t)
+        v1_f = v1 + D_v1_t
+        w1_f = w1 + D_w1
+        v2_f = v2 - D_v1_t
+        w2_f = w2 + D_w1
+
+        # calculate new relative contact velocity
+        v1_c_slip = surface_velocity_vw(v1_f, w1_f, unit_x, R)
+        v2_c_slip = surface_velocity_vw(v2_f, w2_f, -unit_x, R)
+        v12_c_slip = v1_c_slip - v2_c_slip
+
+    # if there was no relative velocity to begin with, or if slip changed directions,
+    # then slip condition is invalid so we need to calculate no-slip condition
+    if not has_relative_velocity or np.dot(v12_c, v12_c_slip) <= 0:  # type: ignore
+        # velocity tangent component for no-slip condition
+        D_v1_t = -(1.0 / 7.0) * (v1 - v2 + R * ptmath.cross(w1 + w2, unit_x))
+        D_w1 = -(5.0 / 14.0) * (ptmath.cross(unit_x, v1 - v2) / R + w1 + w2)
+        v1_f = v1 + D_v1_t
+        w1_f = w1 + D_w1
+        v2_f = v2 - D_v1_t
+        w2_f = w2 + D_w1
+
+    # reintroduce the final normal components
+    v1_f[0] = v1_n_f
+    v2_f[0] = v2_n_f
+    w1_f[0] = w1_n_f
+    w2_f[0] = w2_n_f
+
+    return v1_f, w1_f, v2_f, w2_f
+
+
+@attrs.define
+class FrictionalInelastic3D(CoreBallBallCollision):
+    """A simple ball-ball collision model including ball-ball friction, and coefficient of restitution for equal-mass balls
+
+    Largely inspired by Dr. David Alciatore's technical proofs
+    (https://billiards.colostate.edu/technical_proofs), in particular, TP_A-5, TP_A-6,
+    and TP_A-14. These ideas have been extended to include motion of both balls, and a
+    more complete analysis of velocity and angular velocity in their vector forms.
+    """
+
+    friction: BallBallFrictionStrategy = attrs.field(factory=AlciatoreBallBallFriction)
+
+    model: BallBallModel = attrs.field(
+        default=BallBallModel.FRICTIONAL_INELASTIC_3D, init=False, repr=False
+    )
+    dim: Dim = attrs.field(default=Dim.THREE, init=False, repr=False)
+
+    def solve(self, ball1: Ball, ball2: Ball) -> tuple[Ball, Ball]:
+        """Resolves the collision."""
+        rvw1, rvw2 = _resolve_ball_ball(
+            ball1.state.rvw.copy(),
+            ball2.state.rvw.copy(),
+            ball1.params.R,
+            u_b=self.friction.calculate_friction(ball1, ball2),
+            # Average the coefficient of restitution parameters for the two balls
+            e_b=(ball1.params.e_b + ball2.params.e_b) / 2,
+        )
+
+        ball1.state.rvw = rvw1
+        ball2.state.rvw = rvw2
+
+        ball1.state.s = final_ball_motion_state(rvw1, ball1.params.R)
+        ball2.state.s = final_ball_motion_state(rvw2, ball2.params.R)
+
+        return ball1, ball2
+
+
+@attrs.define
+class FrictionalInelastic2D(FrictionalInelastic3D):
+    """A simple ball-ball collision model including ball-ball friction, and coefficient of restitution for equal-mass balls
+
+    For details see :class:`FrictionalInelastic3D`.
+    """
+
+    model: BallBallModel = attrs.field(
+        default=BallBallModel.FRICTIONAL_INELASTIC_2D, init=False, repr=False
+    )
+    dim: Dim = attrs.field(default=Dim.TWO, init=False, repr=False)
+
+    def solve(self, ball1: Ball, ball2: Ball) -> tuple[Ball, Ball]:
+        """Resolves the collision."""
+        ball1, ball2 = super().solve(ball1, ball2)
+
+        # remove any z velocity components for 2D
+        ball1.state.rvw[1, 2] = 0.0
+        ball2.state.rvw[1, 2] = 0.0
+        ball1.state.s = final_ball_motion_state(ball1.state.rvw, ball1.params.R)
+        ball2.state.s = final_ball_motion_state(ball2.state.rvw, ball2.params.R)
+
+        return ball1, ball2

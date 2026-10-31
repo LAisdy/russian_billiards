@@ -1,0 +1,1 @@
+Intentionally empty: this ballset dir must exist for pooltool.layouts (get_ballset validates at import time); the .glb art is not needed headlessly.

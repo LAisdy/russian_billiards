@@ -1,0 +1,272 @@
+from __future__ import annotations
+
+import numpy as np
+from attrs import define, field
+from direct.interval.IntervalGlobal import LerpPosInterval, Sequence
+from panda3d.core import ClockObject, CollisionNode, CollisionSegment, Vec3
+
+import pooltool.utils as utils
+from pooltool.ani.constants import model_dir
+from pooltool.ani.globals import Global
+from pooltool.config import settings
+from pooltool.error import ConfigError, StrokeError
+from pooltool.objects.ball.render import BallRender
+from pooltool.objects.cue.datatypes import Cue
+from pooltool.objects.datatypes import Render
+from pooltool.physics.utils import tip_center_offset, tip_contact_offset
+
+MAX_STROKE_SECONDS = 1.0
+"""How much of a recorded stroke, counted back from the strike, is animated."""
+
+V0_WINDOW_SECONDS = 0.1
+"""The window before the strike that the stroke's speed is averaged over."""
+
+
+@define
+class StrokeRecording:
+    """The cue stick positions a player traced in stroke mode, with their times
+
+    Positions are the stick's offset from the cue ball along its axis, positive when
+    drawn back, and the last one is the strike. An empty recording is a shot taken
+    without stroking, which animates as no stroke.
+    """
+
+    positions: list[float] = field(factory=list)
+    times: list[float] = field(factory=list)
+
+    def key_times(self) -> tuple[float, float, float]:
+        """Times of the start of the backswing, its apex, and the strike
+
+        All zero for an empty recording.
+        """
+        if not self.positions:
+            return (0.0, 0.0, 0.0)
+
+        # Find the index of the apex (highest point in the backswing)
+        apex_index = self.positions.index(max(self.positions))
+
+        # Find the index of the backstroke start (lowest point before the apex)
+        backstroke_index = self.positions.index(min(self.positions[: apex_index + 1]))
+
+        # The last position in the list is considered the strike
+        return (self.times[backstroke_index], self.times[apex_index], self.times[-1])
+
+    def is_shot(self) -> bool:
+        """Whether the recording is a full stroke rather than an incidental contact"""
+        if len(self.times) < 10:
+            # There is only a handful of frames
+            return False
+
+        if not any(x > 0 for x in self.positions):
+            # No backstroke
+            return False
+
+        backstroke_time, _, strike_time = self.key_times()
+        return strike_time - backstroke_time >= 0.3
+
+    def V0(self) -> float:
+        """The stick's average speed over ``V0_WINDOW_SECONDS`` before the strike
+
+        Raises:
+            StrokeError: The apex of the backswing is inside the window, so the
+                average would span the change of direction.
+        """
+        _, apex_time, strike_time = self.key_times()
+        if strike_time - apex_time < V0_WINDOW_SECONDS:
+            raise StrokeError("Unresolved edge case")
+
+        for position, time in zip(self.positions[::-1], self.times[::-1]):
+            if strike_time - time > V0_WINDOW_SECONDS:
+                return position / V0_WINDOW_SECONDS
+
+        raise StrokeError("Unresolved edge case")
+
+    def trimmed(self, seconds: float) -> StrokeRecording:
+        """The recording from ``seconds`` before the strike, or all of it if shorter"""
+        _, _, strike_time = self.key_times()
+        if strike_time <= seconds:
+            return self
+
+        cutoff = strike_time - seconds
+        start = min(range(len(self.times)), key=lambda i: abs(self.times[i] - cutoff))
+        return StrokeRecording(self.positions[start:], self.times[start:])
+
+
+class CueRender(Render):
+    def __init__(self, cue: Cue):
+        Render.__init__(self)
+
+        self.follow: BallRender
+
+        self._cue = cue
+        self.stroke_clock = ClockObject()
+        self.has_focus = False
+
+        self.stroke = StrokeRecording()
+
+    def set_object_state_as_render_state(self, skip_V0=False):
+        (
+            V0,
+            self._cue.phi,
+            self._cue.theta,
+            self._cue.a,
+            self._cue.b,
+            self._cue.cue_ball_id,
+        ) = self.get_render_state()
+
+        if not skip_V0:
+            self._cue.V0 = V0
+
+    def set_render_state_as_object_state(self):
+        self.match_ball_position()
+
+        cue_stick = self.get_node("cue_stick")
+        cue_stick_focus = self.get_node("cue_stick_focus")
+
+        cue_stick_focus.setH(self._cue.phi + 180)  # phi
+        cue_stick_focus.setR(-self._cue.theta)  # theta
+
+        tip_offset_a, tip_offset_b = tip_center_offset(
+            np.array([self._cue.a, self._cue.b]),
+            self._cue.specs.tip_radius,
+            self.follow._ball.params.R,
+        )
+        cue_stick.setY(-tip_offset_a * self.follow._ball.params.R)  # a
+        cue_stick.setZ(tip_offset_b * self.follow._ball.params.R)  # b
+
+    def init_model(self):
+        name = self._cue.model_name or "cue"
+        path = utils.panda_path(model_dir / "cue" / name / "cue.glb")
+        cue_stick_model = Global.loader.loadModel(path)
+        cue_stick_model.setName("cue_stick_model")
+
+        cue_stick = Global.render.find("scene").find("table").attachNewNode("cue_stick")
+        cue_stick_model.reparentTo(cue_stick)
+
+        self.nodes["cue_stick"] = cue_stick
+        self.nodes["cue_stick_model"] = cue_stick_model
+
+    def init_focus(self, ball: BallRender):
+        self.follow = ball
+
+        self.get_node("cue_stick_model").setPos(self.follow._ball.params.R, 0, 0)
+
+        cue_stick_focus = (
+            Global.render.find("scene").find("table").attachNewNode("cue_stick_focus")
+        )
+        self.nodes["cue_stick_focus"] = cue_stick_focus
+
+        self.match_ball_position()
+        self.get_node("cue_stick").reparentTo(cue_stick_focus)
+
+        self.has_focus = True
+
+    def init_collision_handling(self, collision_handler):
+        if not settings.gameplay.cue_collision:
+            return
+
+        if not self.rendered:
+            raise ConfigError(
+                "Cue.init_collision_handling :: Cue has not been rendered, "
+                "so collision handling cannot be initialized."
+            )
+
+        bounds = self.get_node("cue_stick").get_tight_bounds()
+
+        x = 0
+        X = bounds[1][0] - bounds[0][0]
+
+        cnode = CollisionNode("cue_cseg")
+        cnode.set_into_collide_mask(0)
+        collision_node = self.get_node("cue_stick_model").attachNewNode(cnode)
+        collision_node.node().addSolid(CollisionSegment(x, 0, 0, X, 0, 0))
+
+        self.nodes["cue_cseg"] = collision_node
+        Global.base.cTrav.addCollider(collision_node, collision_handler)
+
+        if settings.graphics.debug:
+            collision_node.show()
+
+    def get_length(self):
+        bounds = self.get_node("cue_stick").get_tight_bounds()
+        return bounds[1][0] - bounds[0][0]
+
+    def track_stroke(self):
+        """Start a new stroke recording"""
+        self.stroke = StrokeRecording()
+        self.stroke_clock.reset()
+
+    def append_stroke_data(self):
+        """Append current cue position and timestamp to the stroke recording"""
+        self.stroke.positions.append(self.get_node("cue_stick").getX())
+        self.stroke.times.append(self.stroke_clock.getRealTime())
+
+    def get_stroke_sequence(self, stroke: StrokeRecording) -> Sequence:
+        """Animate the stick along ``stroke``, from ``MAX_STROKE_SECONDS`` before the strike"""
+
+        cue_stick = self.get_node("cue_stick")
+        stroke_sequence = Sequence()
+
+        # If the stroke is longer than MAX_STROKE_SECONDS, truncate to MAX_STROKE_SECONDS
+        stroke = stroke.trimmed(MAX_STROKE_SECONDS)
+        xs = np.array(stroke.positions)
+        dts = np.diff(np.array(stroke.times))
+
+        y, z = cue_stick.getY(), cue_stick.getZ()
+
+        for i in range(len(dts)):
+            stroke_sequence.append(
+                LerpPosInterval(
+                    nodePath=cue_stick, duration=dts[i], pos=Vec3(xs[i + 1], y, z)
+                )
+            )
+
+        return stroke_sequence
+
+    def match_ball_position(self):
+        """Update the cue stick's position to match the cueing ball's position"""
+        self.get_node("cue_stick_focus").setPos(self.follow.get_node("pos").getPos())
+
+    def get_render_state(self) -> tuple[float, float, float, float, float, str]:
+        """Return phi, theta, V0, a, and b as determined by the cue_stick node"""
+
+        cue_stick = self.get_node("cue_stick")
+        cue_stick_focus = self.get_node("cue_stick_focus")
+
+        phi = (cue_stick_focus.getH() + 180) % 360
+
+        try:
+            V0 = self.stroke.V0()
+        except StrokeError:
+            V0 = 0.1
+
+        theta = -cue_stick_focus.getR()
+        a, b = tip_contact_offset(
+            np.array([-cue_stick.getY(), cue_stick.getZ()])
+            / self.follow._ball.params.R,
+            self._cue.specs.tip_radius,
+            self.follow._ball.params.R,
+        )
+        ball_id = self.follow._ball.id
+
+        return V0, phi, theta, a, b, ball_id
+
+    @property
+    def visible(self) -> bool:
+        return not self.get_node("cue_stick").is_hidden()
+
+    def show(self) -> None:
+        """Draw the cue
+
+        Visibility is switched on the stick node alone, which is the node the stroke
+        animation shows and hides, so a mode and a playback never disagree on it.
+        """
+        self.get_node("cue_stick").show()
+
+    def hide(self) -> None:
+        """Stop drawing the cue"""
+        self.get_node("cue_stick").hide()
+
+    def render(self):
+        super().render()
+        self.init_model()

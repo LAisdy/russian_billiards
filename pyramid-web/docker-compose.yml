@@ -1,0 +1,43 @@
+# pyramid-web — multiplayer Russian Pyramid billiards (web port).
+#
+# One command brings up the whole game:
+#     docker-compose up -d --build
+#
+#   frontend (nginx + Three.js):  http://localhost:8080
+#   backend (FastAPI, API docs):  http://localhost:8000/docs
+#
+# The frontend proxies /api and /ws to the backend internally, so the
+# browser only ever needs the frontend origin.
+
+name: pyramid-web
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: docker/backend.Dockerfile
+    image: pyramid-web/backend:latest
+    container_name: pyramid-web-backend
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  frontend:
+    build:
+      context: .
+      dockerfile: docker/frontend.Dockerfile
+    image: pyramid-web/frontend:latest
+    container_name: pyramid-web-frontend
+    restart: unless-stopped
+    ports:
+      - "8080:80"
+    depends_on:
+      backend:
+        condition: service_healthy

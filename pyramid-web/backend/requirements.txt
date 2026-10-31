@@ -1,0 +1,20 @@
+# pyramid-web backend dependencies.
+#
+# The physics stack is pinned to the EXACT versions of the pooltool source
+# venv (see backend/pooltool/VENDORED.md) so that simulation results are
+# bit-reproducible against the original library.
+
+fastapi==0.162.0
+uvicorn[standard]==0.54.0
+
+# pooltool physics engine (vendored under backend/pooltool/)
+numpy==2.3.5
+numba==0.62.1
+llvmlite==0.45.1
+scipy==1.18.1
+attrs==26.1.0
+cattrs==26.2.1
+msgpack==1.2.3
+msgpack-numpy==0.4.8
+PyYAML==6.0.3
+rich==14.3.4
