@@ -32,6 +32,8 @@ import time
 
 import attrs
 import numpy as np
+
+import pooltool as pt
 import pooltool.constants as const
 from pooltool.error import SimulateError
 from pooltool.events.datatypes import AgentType, EventType
@@ -41,8 +43,6 @@ from pooltool.objects.table.collection import TABLE_SPECS, TableName
 from pooltool.objects.table.datatypes import Table
 from pooltool.physics.resolve.resolver import Resolver
 from pooltool.ruleset.datatypes import Ruleset
-
-import pooltool as pt
 
 GAME_TYPE = GameType.RUSSIAN_PYRAMID_FREE
 

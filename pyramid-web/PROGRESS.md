@@ -1650,3 +1650,26 @@ and every container start afterwards is WARM — the first shot animates in
 sub-second time instead of blocking minutes. If a deploy ever fails inside
 the bake RUN, the physics stack itself failed to compile — that failure is
 now visible at build time instead of at game time.
+
+### Verification round after the second «NEXT» (2026-11-02) — ALL GREEN
+
+Full independent re-verification of the Step 10 fix set on the current tree
+(no functional changes were needed — the round also produced the numbers that
+close out the "16-second shot" field report):
+
+- **Cross-process JIT disk-cache proof** (`scripts/jit_cache_crosscheck.py`,
+  two fresh interpreter processes): FIRST full keyframes shot 374 ms / 370 ms
+  (identical across processes — zero recompilation), steady-state 135–180 ms.
+  Conclusion: with the baked cache a freshly restarted container pays NO JIT;
+  the historical 16.8 s first shot is fully explained by the pre-A3 image
+  (cold in-process JIT on a throttled free-tier CPU) and is gone with the
+  bake RUN.
+- `verify_step10_fixes.py` against a live uvicorn: **22/22 PASS** (shot_ack
+  0.00 s, ping answered DURING simulation, keyframes+pocketed, verdict
+  propagation, practice scratch → respot → ball-in-hand → re-rack).
+- `verify_step9_docker.py` **93/93**, `verify_render_deploy.py` **46/46**,
+  `node --check` main.js/lobby.js PASS, `probe_shot_pipeline.py` PASS
+  (two-player turn switch + solo practice ruleset).
+- Hygiene: cleared the stray executable bit on `backend/app/*.py` and sorted
+  `app/physics.py` imports (ruff `--fix`); `ruff check app` now fully clean;
+  module re-import verified. `download/pooltool_russian.zip` refreshed.
