@@ -26,6 +26,7 @@ mode-driven (Step 6): pass the vendored ``Ruleset`` instance to
 from __future__ import annotations
 
 import json
+import os
 import random
 import threading
 import time
@@ -62,6 +63,13 @@ TABLE_L = float(_TABLE_PROTO.l)
 TABLE_W = float(_TABLE_PROTO.w)
 BALL_R = float(_BALL_PARAMS.R)
 MIN_SEPARATION = 2 * BALL_R - 1e-4  # rack balls sit at ~2R apart (spacing 1e-3)
+
+#: Pocket and cushion-segment ids (used by the Step 11 terminal-state bridge
+#: to validate client-reported capture/cushion events against real spec ids).
+POCKET_IDS = frozenset(_TABLE_PROTO.pockets.keys())
+CUSHION_SEGMENT_IDS = frozenset(_TABLE_PROTO.cushion_segments.linear) | frozenset(
+    _TABLE_PROTO.cushion_segments.circular
+)
 
 #: How far beyond the cushion noses an on-table ball may rest. Non-zero
 #: because a ball can sit in a pocket mouth, against the jaws — physics-
@@ -125,6 +133,25 @@ def ball_params() -> dict:
         "diameter_mm": round(2 * BALL_R * 1000, 1),
         "mass": float(_BALL_PARAMS.m),
     }
+
+
+# --- Step 11: synthetic-system helpers (client-side physics bridge) ----------
+
+
+def fresh_table() -> Table:
+    """A fresh table copy (pockets accumulate ``contains`` during ruleset
+    processing, so systems must never share one)."""
+    return _TABLE_PROTO.copy()
+
+
+def make_ball(ball_id: str, xy: tuple[float, float]) -> pt.Ball:
+    """A pooltool ball with the Russian equipment parameters at ``xy``."""
+    return pt.Ball.create(ball_id, xy=xy, ballset=None, **_BALL_PARAMS_KWARGS)
+
+
+def ball_id_key(ball_id: str) -> tuple[int, str]:
+    """Public sort key: object balls numeric first, the cue ball last."""
+    return _ball_id_key(ball_id)
 
 
 def russian_rack(seed: int | None = None) -> dict[str, dict]:
@@ -542,13 +569,18 @@ def warmup() -> None:
     keyframe interpolation path) in a background thread so the first real
     request is not billed seconds of JIT.
 
-    Mirrors the desktop app's startup strategy (see pooltool PROGRESS.md:
-    "full-rack JIT warmup"): System.example() covers the 2D/shared kernels,
-    then a seeded 3D break compiles every hot 3D path with a realistic event
-    mix, and a keyframe-format stroke compiles the interpolation machinery
-    the wire payload uses (Step 10: the web game's shot path must never pay
-    JIT inside a request). ~25-30 s total; steady-state shots are 75-190 ms.
+    Step 11: gameplay no longer touches pooltool physics (the client's JS
+    engine simulates strokes; the server only judges terminal states with
+    the pure-Python rulesets), so deployments can skip the warmup entirely
+    with ``PYRAMID_WARMUP=0`` (the Docker image sets it): the free-tier CPU
+    stays cool and ``warm_ready()`` reports True immediately. The REST
+    ``/api/shot`` endpoint remains available for testing; without a warmup
+    its first call pays the JIT cost.
     """
+    if os.environ.get("PYRAMID_WARMUP", "1").strip().lower() in {"0", "false", "off"}:
+        _warmup_state["ready"] = True
+        print("[physics] warmup disabled (PYRAMID_WARMUP=0) — ready", flush=True)
+        return
     if _warmup_state["started"]:
         return
     _warmup_state["started"] = True

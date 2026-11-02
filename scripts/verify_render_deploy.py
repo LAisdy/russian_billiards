@@ -114,8 +114,8 @@ def check_backend_dockerfile() -> None:
 def check_main_py() -> None:
     section("C. backend/app/main.py (static mount, gzip, precedence)")
     text = (PWEB / "backend/app/main.py").read_text()
-    check('VERSION bumped to "0.8.0" (Step 10 gameplay fixes)',
-          'VERSION = "0.8.0"' in text)
+    check('VERSION bumped to "0.11.0" (Step 11 client-side physics)',
+          'VERSION = "0.11.0"' in text)
     check("imports StaticFiles", "from fastapi.staticfiles import StaticFiles" in text)
     check("imports GZipMiddleware",
           "from starlette.middleware.gzip import GZipMiddleware" in text)

@@ -209,28 +209,23 @@ def check_backend_dockerfile() -> None:
     check("PYRAMID_STATIC_DIR points at the copied UI tree",
           "PYRAMID_STATIC_DIR=/app/static" in envs)
 
-    # Step 10 (A3): the JIT cache is BAKED into the image so fresh containers
-    # never pay the ~25 s+ cold numba compile inside the first request (the
-    # render.com field report's frozen-game landmine).
+    # Step 11 (architecture change): gameplay physics moved INTO the client
+    # (frontend/physics.js, vendored cannon-es) — the image ships NO baked
+    # JIT cache and the numba warmup is disabled by default (free-tier CPU
+    # stays cool; the REST /api/shot test endpoint is cold but available).
     bakes = [a for name, a in inst if name == "RUN" and "physics.warmup()" in a]
-    check("numba JIT cache baked: RUN physics.warmup() before USER",
-          len(bakes) == 1)
-    check("bake asserts the engine reached the ready state",
-          len(bakes) == 1 and "warm_ready" in bakes[0])
-    bake_idx = next((i for i, (name, a) in enumerate(inst)
-                     if name == "RUN" and "physics.warmup()" in a), -1)
-    user_idx = next((i for i, (name, _) in enumerate(inst) if name == "USER"), -1)
-    chown_idx = next((i for i, (name, a) in enumerate(inst)
-                      if name == "RUN" and "chown" in a), -1)
-    check("bake runs BEFORE chown/USER (root may write the cache into /app)",
-          -1 not in (bake_idx, user_idx, chown_idx) and bake_idx < chown_idx < user_idx)
-    check("NUMBA_CPU_NAME=generic (baked code portable across the CPU fleet)",
-          "NUMBA_CPU_NAME=generic" in envs)
+    check("no bake RUN (client-side physics: no JIT cache needed)",
+          len(bakes) == 0)
+    check("PYRAMID_WARMUP=0 (warmup opt-in only)",
+          "PYRAMID_WARMUP=0" in envs)
+    check("frontend ships the JS physics engine",
+          "COPY frontend ./static" in " ".join(a for n, a in inst if n == "COPY")
+          or any(n == "COPY" and "frontend" in a for n, a in inst))
 
     cmds = [a for name, a in inst if name == "CMD"]
     check("single CMD, uvicorn without --reload",
           len(cmds) == 1 and "uvicorn" in cmds[0] and "--reload" not in cmds[0])
-    check("CMD has no --workers flag (single worker: in-memory lobby + numba)",
+    check("CMD has no --workers flag (single worker: in-memory lobby)",
           len(cmds) == 1 and "--workers" not in cmds[0])
     check("CMD binds 0.0.0.0 with ${PORT:-8000} (render.com $PORT; compose default 8000)",
           len(cmds) == 1 and "--host" in cmds[0] and "0.0.0.0" in cmds[0]

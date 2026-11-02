@@ -36,6 +36,19 @@ Step 8 scope:
     lobby-level timeout enforcement would re-implement a rule, which the
     frozen-rules decisions forbid (see PROGRESS.md, Step 8).
 
+Step 11 scope (architecture change — client-side JS physics):
+  - the client simulates the stroke in its own browser (frontend/physics.js,
+    vendored cannon-es) and sends ONE ``shot`` message when the balls stop:
+    final resting positions + pocketed/cushion/first-contact events (see
+    ``app/bridge.py``). The server runs NO pooltool physics for gameplay —
+    it validates the report, reconstructs the synthetic ruleset input and
+    calls ``process_and_advance`` synchronously (microseconds), then
+    broadcasts ``shot_result`` WITHOUT keyframes: every client applies the
+    authoritative post-rules state (the shooter's local view is corrected
+    for respots / penalty removals, the opponent's board snaps to the final
+    state). "Simulating shot…" cannot exist anymore; the only wait left is
+    a microseconds-fast rules round-trip.
+
 Design decisions (logged in pyramid-web/PROGRESS.md):
   - In-memory state, single process. Rooms are deleted when empty.
   - MAX_PLAYERS = 2 (Russian Pyramid is a two-player game; spectators are a
@@ -52,18 +65,16 @@ Design decisions (logged in pyramid-web/PROGRESS.md):
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import random
 import string
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any
 
 from fastapi import WebSocket
 
-from . import physics, rules
+from . import bridge, physics, rules
 
 logger = logging.getLogger(__name__)
 
@@ -108,13 +119,12 @@ class Room:
     # Step 6: selected discipline (host-set in the lobby, applied on start).
     mode: str = DEFAULT_MODE
     # Step 6: the live vendored ruleset instance (opaque here — driven via
-    # app/rules.py + app/physics.py). None until the game starts.
+    # app/rules.py + app/bridge.py). None until the game starts.
     game: object | None = None
     # Current on-table ball state (pocketed/removed balls excluded); a
     # fresh random rack is dealt on start_game and updated after every shot.
     balls: dict[str, dict[str, float]] = field(default_factory=dict)
     shot_seq: int = 0
-    shot_busy: bool = False
     # Step 8: epoch ms when the current stroke's thinking time began (set on
     # start_game and refreshed with every shot_result broadcast).
     turn_started_ms: int = 0
@@ -122,9 +132,6 @@ class Room:
     practice: bool = False
     practice_bih: str = "none"  # live ball-in-hand grant for practice
     practice_last: dict | None = None  # last_shot block for the snapshot
-    # Step 10: the in-flight simulation task (shots are dispatched off the
-    # receive loop so keepalive pings stay answered during long cold-JIT sims).
-    shot_task: Any = None
 
     @property
     def host(self) -> Player | None:
@@ -326,7 +333,6 @@ class LobbyManager:
         room.state = PLAYING
         room.balls = physics.russian_rack()  # fresh random rack, dealt once
         room.shot_seq = 0
-        room.shot_busy = False
         room.game = rules.new_game(room.mode, room.players)
         room.practice = False
         room.practice_bih = "none"
@@ -375,35 +381,6 @@ class LobbyManager:
             who = active.name if active else active_id
             raise LobbyError("not_your_turn", f"it is {who}'s turn")
 
-    @staticmethod
-    def _clean_shot(msg: dict) -> dict:
-        """Validate a client shot message into physics kwargs (ranges mirror
-        the REST ShotIn model)."""
-
-        def num(key: str, default: float | None = None) -> float:
-            raw = msg.get(key, default)
-            if isinstance(raw, bool) or not isinstance(raw, (int, float)):
-                raise LobbyError("invalid_shot", f"'{key}' must be a number")
-            return float(raw)
-
-        v0 = num("v0")
-        phi = num("phi")
-        a = num("a", physics.DEFAULT_A)
-        b = num("b", physics.DEFAULT_B)
-        theta = num("theta", physics.DEFAULT_THETA)
-        if not physics.V0_RANGE[0] < v0 <= physics.V0_RANGE[1]:
-            raise LobbyError("invalid_shot", f"v0 must be in {physics.V0_RANGE}")
-        if not physics.PHI_RANGE[0] <= phi < physics.PHI_RANGE[1]:
-            raise LobbyError("invalid_shot", f"phi must be in {physics.PHI_RANGE}")
-        for name, val in (("a", a), ("b", b)):
-            if not physics.SPIN_RANGE[0] <= val <= physics.SPIN_RANGE[1]:
-                raise LobbyError(
-                    "invalid_shot", f"{name} must be in {physics.SPIN_RANGE}"
-                )
-        if not physics.THETA_RANGE[0] <= theta <= physics.THETA_RANGE[1]:
-            raise LobbyError("invalid_shot", f"theta must be in {physics.THETA_RANGE}")
-        return {"v0": v0, "phi": phi, "a": a, "b": b, "theta": theta}
-
     def _apply_call(self, room: Room, msg: dict) -> None:
         """Classic («заказ») call intake: validate and write into the
         ruleset's current shot constraints (read by build_shot_info)."""
@@ -433,141 +410,76 @@ class LobbyManager:
         constraints.pocket_call = pocket_call
 
     async def shot(self, session: Session, msg: dict) -> None:
-        """Accept a stroke, acknowledge it, and simulate in the background.
+        """Judge a client-simulated stroke from its terminal report (Step 11).
 
-        Step 10 hardening: the receive loop is NO LONGER blocked while the
-        physics runs (a cold-JIT first shot on free hosting used to block it
-        for minutes) — keepalive pings stay answered, and the client gets an
-        immediate ``shot_ack`` plus an ``engine_status`` broadcast when the
-        engine is still warming up (see PROGRESS.md, Step 10 / Issue 2).
+        The shooting client has ALREADY simulated the stroke locally and
+        animated it; this handler only validates the report, reconstructs
+        the synthetic ruleset input (``app/bridge.py``) and runs the frozen
+        rulesets synchronously (microseconds — no physics, no worker thread,
+        no "Simulating…" window). The broadcast carries the authoritative
+        post-rules state for every client.
         """
         room = session.room
         self._require_active_shooter(room, session)
-        if room.shot_busy:
-            raise LobbyError("shot_busy", "the previous shot is still being processed")
-        params = self._clean_shot(msg)
         if not room.practice:
             # Classic («заказ») call intake — ruleset modes only (practice has
             # no ruleset and thus no shot constraints to write into).
             self._apply_call(room, msg)
-        room.shot_busy = True
-        room.shot_seq += 1
-        shot_id = room.shot_seq
-        shooter = session.player
-        balls_in = {
-            ball_id: (pos["x"], pos["y"]) for ball_id, pos in room.balls.items()
+
+        pre_balls = {
+            ball_id: {"x": float(pos["x"]), "y": float(pos["y"])}
+            for ball_id, pos in room.balls.items()
         }
-        game_obj = room.game
-        warm = physics.warm_ready()
-        logger.info(
-            "shot #%d accepted room=%s player=%s(%s) v0=%.2f phi=%.1f a=%.2f "
-            "b=%.2f theta=%.1f balls=%d practice=%s engine_warm=%s",
-            shot_id, room.code, shooter.name, shooter.id, params["v0"],
-            params["phi"], params["a"], params["b"], params["theta"],
-            len(balls_in), room.practice, warm,
-        )
-        # Immediate acknowledgement: lets the client distinguish "message
-        # lost / socket dead" (no ack) from "server still simulating".
-        await self._send(shooter, {"type": "shot_ack", "shot_id": shot_id})
-        if not warm:
-            await self._broadcast(
-                room,
-                {
-                    "type": "engine_status",
-                    "ready": False,
-                    "message": "physics engine is warming up — the first shot "
-                    "after a cold start can take a minute on free hosting",
-                },
-            )
-        room.shot_task = asyncio.create_task(
-            self._process_shot(room, shooter, balls_in, params, shot_id, game_obj)
-        )
-
-    async def _process_shot(
-        self,
-        room: Room,
-        shooter: Player,
-        balls_in: dict[str, tuple[float, float]],
-        params: dict,
-        shot_id: int,
-        game_obj: object,
-    ) -> None:
-        """Run the simulation off the event loop and broadcast the result.
-
-        Every failure path resets ``shot_busy`` and reports to the shooter —
-        nothing in here may leave a client stuck at "Simulating…" silently.
-        """
         try:
-            t0 = time.perf_counter()
-            if room.practice:
-                result = await asyncio.to_thread(
-                    physics.run_shot_keyframes, balls_in, **params
-                )
-            else:
-                result = await asyncio.to_thread(
-                    physics.run_shot_keyframes, balls_in, game=game_obj, **params
-                )
-        except physics.PhysicsError as exc:
-            logger.warning(
-                "shot #%d rejected room=%s: %s", shot_id, room.code, exc,
-                exc_info=True,
+            report = bridge.parse_report(msg, set(pre_balls))
+        except bridge.InvalidShot as exc:
+            logger.info(
+                "shot report rejected room=%s player=%s: %s",
+                room.code, session.player.name, exc,
             )
-            room.shot_busy = False
-            await self._send(
-                shooter,
-                {"type": "error", "code": "invalid_shot", "message": str(exc)},
-            )
-            return
-        except Exception as exc:  # defensive: report, keep everything alive
-            logger.exception("shot #%d failed room=%s", shot_id, room.code)
-            room.shot_busy = False
-            await self._send(
-                shooter,
-                {
-                    "type": "error",
-                    "code": "shot_failed",
-                    "message": f"internal error: {exc}",
-                },
-            )
-            return
+            raise LobbyError("invalid_shot", str(exc)) from exc
 
-        kf = result["kf_stats"]
+        shooter = session.player
+        shot_id = room.shot_seq + 1
         logger.info(
-            "shot #%d simulated room=%s wall=%.2fs physics=%sms frames=%d "
-            "events=%d bytes=%d pocketed=%s",
-            shot_id, room.code, time.perf_counter() - t0, result["sim_ms"],
-            kf["frames"], kf["events"], kf["bytes"], result["pocketed"],
+            "shot #%d report room=%s player=%s(%s) v0=%.2f phi=%.1f "
+            "balls=%d pocketed=%s practice=%s",
+            shot_id, room.code, shooter.name, shooter.id, report["v0"],
+            report["phi"], len(pre_balls),
+            [p["ball"] for p in report["pocketed"]], room.practice,
         )
 
-        if room.state != PLAYING:
-            logger.info(
-                "shot #%d dropped room=%s — room left the playing state",
-                shot_id, room.code,
-            )
-            room.shot_busy = False
-            return
         if room.practice:
-            await self._finish_practice_shot(room, shooter, result, shot_id)
-            return
-        # Ruleset mode: an abort / rematch raced the in-flight simulation.
-        if room.game is not game_obj or room.shot_seq != shot_id:
-            logger.info(
-                "shot #%d dropped room=%s — the game changed while simulating",
-                shot_id, room.code,
-            )
-            room.shot_busy = False
-            return
+            outcome = self._practice_outcome(room, report)
+        else:
+            try:
+                outcome = bridge.apply_ruleset(report, pre_balls, room.game)
+            except bridge.InvalidShot as exc:
+                logger.warning(
+                    "shot #%d rejected room=%s: %s", shot_id, room.code, exc,
+                    exc_info=True,
+                )
+                raise LobbyError("invalid_shot", str(exc)) from exc
+            except Exception as exc:  # defensive: report, keep everything alive
+                logger.exception("shot #%d failed room=%s", shot_id, room.code)
+                raise LobbyError(
+                    "shot_failed", f"internal error: {exc}"
+                ) from exc
 
+        room.shot_seq = shot_id
         # Authoritative post-shot state: the ruleset has already respotted /
         # removed balls, so room.balls is exactly the on-table world.
-        room.balls = result["balls"]
-        verdict = result["rules"]
-
+        room.balls = outcome["balls"]
         # Step 8: thinking time for the upcoming stroke starts when the
-        # result lands (also on legal continuations — the clock measures
+        # verdict lands (also on legal continuations — the clock measures
         # per-stroke preparation, not per-turn ownership).
         room.turn_started_ms = int(time.time() * 1000)
 
+        snapshot = (
+            self._practice_snapshot(room)
+            if room.practice
+            else rules.game_snapshot(room.mode, room.game, room.players)
+        )
         await self._broadcast(
             room,
             {
@@ -575,28 +487,55 @@ class LobbyManager:
                 "shot_id": shot_id,
                 "by": shooter.id,
                 "by_name": shooter.name,
-                "keyframes": result["keyframes"],
-                "pocketed": result["pocketed"],
-                "respotted": result["respotted"],
-                "removed": result["removed"],
-                "legal": verdict["legal"],
-                "reason": verdict["reason"],
+                "pocketed": outcome["pocketed"],
+                "respotted": outcome["respotted"],
+                "removed": outcome["removed"],
+                "legal": outcome["legal"],
+                "reason": outcome["reason"],
                 "balls": room.balls,
-                "sim_ms": result["sim_ms"],
-                # Step 7 traffic profiling: keyframe frame/event counts,
-                # serialized bytes and how many stationary-tail frames were
-                # pruned (identical dict on every client — same broadcast).
-                "kf_stats": result["kf_stats"],
-                "game": room.stamp_turn_clock(
-                    rules.game_snapshot(room.mode, room.game, room.players)
-                ),
+                "judge_ms": outcome["judge_ms"],
+                "game": room.stamp_turn_clock(snapshot),
             },
         )
-        room.shot_busy = False
         logger.info(
-            "shot_result #%d broadcast room=%s to %d player(s)",
-            shot_id, room.code, len(room.players),
+            "shot_result #%d broadcast room=%s legal=%s to %d player(s)",
+            shot_id, room.code, outcome["legal"], len(room.players),
         )
+
+    def _practice_outcome(self, room: Room, report: dict) -> dict:
+        """Practice post-processing on plain dicts (the vendored rulesets
+        stay frozen): potted balls leave the table, a scratch respots the
+        cue at the deterministic house position and grants ball-in-hand
+        anywhere; the solo player never loses the turn."""
+        balls = {
+            ball_id: {"x": x, "y": y}
+            for ball_id, (x, y) in report["final"].items()
+        }
+        potted = [p["ball"] for p in report["pocketed"]]
+        scratch = "cue" in potted
+        if scratch:
+            x, y = _practice_place_cue(balls)
+            balls["cue"] = {"x": x, "y": y}
+            room.practice_bih = "anywhere"
+        else:
+            room.practice_bih = "none"
+        reason = (
+            "scratch — cue respotted (ball in hand)" if scratch else "practice"
+        )
+        room.practice_last = {
+            "legal": True,
+            "reason": reason,
+            "turn_over": False,
+        }
+        return {
+            "balls": balls,
+            "pocketed": potted,
+            "respotted": [],
+            "removed": [],  # planar client physics has no jumped balls
+            "legal": True,
+            "reason": reason,
+            "judge_ms": 0.0,
+        }
 
     def _practice_snapshot(self, room: Room) -> dict:
         """Wire snapshot for a practice session (same shape as ruleset
@@ -619,65 +558,6 @@ class LobbyManager:
             "last_shot": room.practice_last,
         }
 
-    async def _finish_practice_shot(
-        self, room: Room, shooter: Player, result: dict, shot_id: int
-    ) -> None:
-        """Practice post-processing on plain dicts (the vendored rulesets
-        stay frozen): potted / jumped balls leave the table, a scratch
-        respots the cue at the deterministic house position and grants
-        ball-in-hand anywhere; the solo player never loses the turn."""
-        final = result["balls"]  # {id: {x, y, state}} — raw simulation output
-        potted = list(result["pocketed"])
-        off_table = sorted(
-            bid
-            for bid, b in final.items()
-            if b.get("state") not in physics.ON_TABLE_STATES and bid not in potted
-        )
-        gone = set(potted) | set(off_table)
-        balls = {
-            bid: {"x": b["x"], "y": b["y"]}
-            for bid, b in final.items()
-            if bid not in gone
-        }
-        scratch = "cue" in gone
-        if scratch:
-            x, y = _practice_place_cue(balls)
-            balls["cue"] = {"x": x, "y": y}
-            room.practice_bih = "anywhere"
-        else:
-            room.practice_bih = "none"
-        room.balls = balls
-        room.practice_last = {
-            "legal": True,
-            "reason": "scratch — cue respotted (ball in hand)" if scratch else "practice",
-            "turn_over": False,
-        }
-        room.turn_started_ms = int(time.time() * 1000)
-        await self._broadcast(
-            room,
-            {
-                "type": "shot_result",
-                "shot_id": shot_id,
-                "by": shooter.id,
-                "by_name": shooter.name,
-                "keyframes": result["keyframes"],
-                "pocketed": potted,
-                "respotted": [],
-                "removed": off_table,
-                "legal": True,
-                "reason": room.practice_last["reason"],
-                "balls": balls,
-                "sim_ms": result["sim_ms"],
-                "kf_stats": result["kf_stats"],
-                "game": room.stamp_turn_clock(self._practice_snapshot(room)),
-            },
-        )
-        room.shot_busy = False
-        logger.info(
-            "practice shot_result #%d broadcast room=%s (scratch=%s, balls left=%d)",
-            shot_id, room.code, scratch, len(balls),
-        )
-
     async def practice(self, session: Session) -> None:
         """Step 10: start (or re-rack) a solo practice session.
 
@@ -699,7 +579,6 @@ class LobbyManager:
         room.practice = True
         room.balls = physics.russian_rack()
         room.shot_seq = 0
-        room.shot_busy = False
         room.game = None
         room.practice_bih = "none"
         room.practice_last = None
@@ -726,8 +605,6 @@ class LobbyManager:
         """Ball-in-hand: the active player repositions the cue ball."""
         room = session.room
         self._require_active_shooter(room, session)
-        if room.shot_busy:
-            raise LobbyError("shot_busy", "the previous shot is still being processed")
         if room.practice:
             bih = room.practice_bih
         else:

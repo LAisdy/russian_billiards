@@ -37,6 +37,18 @@ Step 8: UI polish & camera — every game snapshot additionally carries the
         not enforce one); the client renders the HUD bar (scores, turn,
         remaining-ball chips), camera presets with smooth tweens, and
         aspect-ratio-responsive layout.
+Step 11 (architecture change — client-side JS physics): the real-time
+        shot simulation moved INTO the browser (frontend/physics.js,
+        vendored cannon-es). The WS ``shot`` message now carries the
+        client-computed TERMINAL STATE (final resting positions + pocketed/
+        cushion/first-contact events); ``app/bridge.py`` reconstructs the
+        synthetic pooltool System and the vendored rulesets judge it
+        synchronously (microseconds — no numba, no worker thread). The
+        broadcast ``shot_result`` has no keyframes: every client applies
+        the authoritative post-rules state. The numba warmup is skippable
+        via ``PYRAMID_WARMUP=0`` (set in the Docker image) since gameplay
+        never touches pooltool physics; the REST ``/api/shot`` endpoint is
+        kept for headless testing.
 Deployment addendum: single-container hosting (render.com) — when a
         frontend tree is available (``PYRAMID_STATIC_DIR`` env var, or the
         repo's ``frontend/`` next to ``backend/``), it is served by this
@@ -73,7 +85,7 @@ from .physics import PhysicsError
 logger = logging.getLogger(__name__)
 
 APP_NAME = "pyramid-web-backend"
-VERSION = "0.8.0"
+VERSION = "0.11.0"
 
 # Step 10 (A1): app-level logs (shot lifecycle, lobby events) must reach the
 # platform console — uvicorn configures only its own loggers, so without a

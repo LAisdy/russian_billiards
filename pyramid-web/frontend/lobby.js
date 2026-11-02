@@ -1,11 +1,8 @@
-// pyramid-web — lobby UI + WebSocket client (Steps 2, 5, 6 & 8).
+// pyramid-web — lobby UI + WebSocket client (Steps 2, 6, 8 & 11).
 //
 // Connects to the same-origin /ws endpoint (proxied by nginx in production,
 // by scripts/serve_frontend.py in local dev) and drives the lobby overlay:
 // create room / join by 4-letter code / player list / host "Start game".
-// Step 5: on game_started the server-dealt rack is applied to the 3D scene;
-// clicking the table aims the cue ball, the Shoot button sends the stroke
-// over the socket, and every client animates the returned keyframes.
 // Step 6: the host picks one of the four disciplines in the lobby; during
 // play the server game snapshot drives the scoreboard, the turn indicator,
 // Classic called shots («заказ»), ball-in-hand cue placement («с руки» /
@@ -15,6 +12,12 @@
 // side panel keeps only the controls and can collapse. The clock is
 // informational (server-stamped turn_started_ms, skew-corrected client-side)
 // and the "Your turn" toast fires on turn changes.
+// Step 11 (client-side JS physics): Shoot starts the stroke LOCALLY —
+// physics.js simulates it instantly at 60 FPS, the player watches real ball
+// motion, and only when the balls stop does the terminal report (final
+// resting positions + pocketed events) go to the server for judging. There
+// is no server simulation wait anymore: no "Simulating…" ticker, no
+// multi-stage watchdog — the UI can never freeze on a shot.
 
 import { deriveHud, formatElapsed } from './ui_math.js';
 
@@ -67,24 +70,14 @@ const MODE_NAMES = {
   practice: 'Practice',
 };
 
-// Step 10: shot watchdog stages — [delay_ms, message]. The client keeps
-// waiting (the server stays authoritative); these only keep the player
-// INFORMED instead of a silent frozen "Simulating…" ticker. A retry while
-// the server is genuinely busy returns the server's own shot_busy error.
+// Step 11: the only remaining wait is the server's rules round-trip after
+// the local simulation finishes (the vendored rulesets judge in
+// microseconds). This watchdog is purely informational and should never
+// fire; it replaces the old multi-stage "simulating…" escalation.
 const WATCHDOG_STAGES = [
   [
-    10000,
-    'Still no result — the physics engine may be warming up (the first shot '
-      + 'after a cold start can take a minute on free hosting).',
-  ],
-  [
-    30000,
-    'Still simulating — free-tier hosting can be slow on the first shot. '
-      + 'Waiting…',
-  ],
-  [
-    90000,
-    'Taking unusually long — the server may be under heavy load. Waiting…',
+    15000,
+    'Still no verdict from the server — it may be under heavy load. Waiting…',
   ],
 ];
 
@@ -285,28 +278,8 @@ async function joinRoom() {
 }
 
 function powerToV0(pct) {
-  // slider 1..100 % -> cue speed 0.3 .. 9.0 m/s (API range is (0.05, 10])
-  return 0.3 + (pct / 100) * 8.7;
-}
-
-// Step 7: live "Simulating… N ms" ticker. Purely informational — the canvas,
-// camera and orbit controls stay fully interactive the whole time; the UI
-// must never show a blocking "Calculating shot…" screen.
-let simTicker = null;
-
-function startSimTicker() {
-  stopSimTicker();
-  const t0 = performance.now();
-  simTicker = setInterval(() => {
-    els.gameHint.textContent = `Simulating shot… ${Math.round(performance.now() - t0)} ms`;
-  }, 100);
-}
-
-function stopSimTicker() {
-  if (simTicker) {
-    clearInterval(simTicker);
-    simTicker = null;
-  }
+  // slider 1..100 % -> cue speed 0.3 .. 8.0 m/s (physics.js clamps at 8)
+  return 0.3 + (pct / 100) * 7.7;
 }
 
 // --- Step 8: game HUD bar -------------------------------------------------------
@@ -493,16 +466,20 @@ function populateCallBalls(hittable) {
 function updateControls() {
   const g = state.game;
   const gameOver = Boolean(g && g.game_over);
-  const animating = Boolean(PYRAMID()?.isAnimating());
+  const game = PYRAMID();
+  const rolling = Boolean(game && game.physicsBusy && game.physicsBusy());
+  const animating = Boolean(game && game.isAnimating && game.isAnimating());
   const mine = myTurn() && !gameOver;
   els.shoot.disabled = !mine || state.shotInFlight || animating;
   let hint;
   if (gameOver) {
     hint = 'Game over.';
+  } else if (rolling) {
+    hint = 'Balls rolling…';
   } else if (state.shotInFlight) {
-    hint = 'Simulating shot…';
+    hint = 'Server is judging the shot…';
   } else if (animating) {
-    hint = 'Animating shot…';
+    hint = 'Balls dropping…';
   } else if (mine && state.placingCue) {
     hint = 'Ball in hand: click the table to place the cue ball.';
   } else if (mine && g && g.call_shot) {
@@ -585,7 +562,7 @@ function sendShot() {
   }
   if (state.shotInFlight) return;
   const game = PYRAMID();
-  if (game && game.isAnimating()) return; // previous stroke still animating
+  if (game && game.isAnimating()) return; // previous stroke still resolving
   if (!myTurn()) {
     showToast('It is not your turn.');
     return;
@@ -595,31 +572,54 @@ function sendShot() {
   const aim = game && typeof game.currentAim === 'function'
     ? game.currentAim()
     : state.aimPhi;
-  const phiDeg = ((aim * 180) / Math.PI + 360) % 360;
-  const payload = { type: 'shot', v0: powerToV0(pct), phi: phiDeg };
-  if (!els.callRow.hidden) {
-    payload.ball_call = els.callBall.value;
-    payload.pocket_call = els.callPocket.value;
+  // Step 11: the stroke is simulated LOCALLY and instantly — physics.js
+  // animates the real ball motion at 60 FPS; nothing is sent until the balls
+  // stop. The UI can never freeze waiting for a server simulation.
+  const started = game && typeof game.beginShot === 'function'
+    ? game.beginShot(powerToV0(pct), aim, onLocalShotComplete)
+    : false;
+  if (!started) {
+    showToast('Cannot start the shot.');
+    return;
   }
-  // Step 10 (A2): payload dump — the exact stroke on the wire, correlated
-  // with the server's "shot #N accepted" log line.
-  console.info('[pyramid] sending shot', JSON.stringify(payload));
-  state.ws.send(JSON.stringify(payload));
   state.shotInFlight = true;
   state.shotSentAt = Date.now();
   state.charging = false;
   // NOTE: setCueCharge(null) is deliberately NOT called here —
   // playCueStrike below consumes the charged pull so the lunge launches
   // from the dragged-back position.
+  console.info('[pyramid] local shot started', {
+    v0: Number(powerToV0(pct).toFixed(2)),
+    phi_deg: Number((((aim * 180) / Math.PI + 360) % 360).toFixed(1)),
+  });
   updateControls();
-  // Optimistic local feedback (Step 7): the cue stick lunges NOW (from the
-  // charged position when charging); the balls themselves animate from the
-  // authoritative server keyframes when the result arrives.
+  // Instant local feedback: the cue stick lunges NOW (from the charged
+  // position when charging) while the balls are already rolling.
   if (game && typeof game.playCueStrike === 'function') {
     game.playCueStrike(aim);
   }
-  startSimTicker();
-  armShotWatchdog();
+}
+
+function onLocalShotComplete(result) {
+  // The balls stopped: send the terminal report. The server judges it with
+  // the vendored ruleset and broadcasts the authoritative verdict.
+  if (!state.ws || state.ws.readyState !== WebSocket.OPEN) {
+    state.shotInFlight = false;
+    updateControls();
+    return;
+  }
+  const payload = { type: 'shot', ...result };
+  if (!els.callRow.hidden) {
+    payload.ball_call = els.callBall.value;
+    payload.pocket_call = els.callPocket.value;
+  }
+  console.info('[pyramid] sending shot report', JSON.stringify({
+    pocketed: result.pocketed,
+    scratch: result.scratch,
+    duration: result.duration,
+  }));
+  state.ws.send(JSON.stringify(payload));
+  armShotWatchdog(); // covers only the (microsecond-fast) rules round-trip
 }
 
 function sendPlaceCue(x, y) {
@@ -740,22 +740,6 @@ function onMessage(msg) {
       startHudClock();
       break;
     }
-    case 'shot_ack': {
-      // Step 10: the server accepted the stroke — distinguish "lost message"
-      // from "still simulating" for the watchdog and the player.
-      console.info(`[pyramid] shot_ack #${msg.shot_id}`);
-      if (state.shotInFlight) {
-        els.gameHint.textContent = 'Server received the shot — simulating…';
-      }
-      break;
-    }
-    case 'engine_status': {
-      // Step 10: cold-start warning broadcast while the engine JIT-warms.
-      console.warn('[pyramid] engine_status', msg);
-      showToast(msg.message || 'Engine warming up…');
-      if (state.shotInFlight) els.gameHint.textContent = msg.message || '';
-      break;
-    }
     case 'shot_result': {
       disarmShotWatchdog();
       console.info('[pyramid] shot_result', {
@@ -763,8 +747,9 @@ function onMessage(msg) {
         legal: msg.legal,
         reason: msg.reason,
         pocketed: msg.pocketed,
-        sim_ms: msg.sim_ms,
-        kf_stats: msg.kf_stats,
+        respotted: msg.respotted,
+        removed: msg.removed,
+        judge_ms: msg.judge_ms,
         latency_ms: state.shotSentAt ? Date.now() - state.shotSentAt : null,
       });
       if (msg.game) setGame(msg.game); // stamp captured at arrival, applied later
@@ -775,7 +760,9 @@ function onMessage(msg) {
       const applyAfter = () => {
         if (applied) return;
         applied = true;
-        stopSimTicker();
+        // Authoritative post-rules state for EVERYONE: the shooter's local
+        // view is corrected (respots / penalty removals), the opponent's
+        // board snaps to the final state instantly.
         if (game && msg.balls) game.setBallPositions(msg.balls);
         if (state.pendingCue) {
           const place = state.pendingCue;
@@ -785,19 +772,15 @@ function onMessage(msg) {
         state.shotInFlight = false;
         applyGameState();
       };
-      if (game && msg.keyframes) {
-        // Step 10: an animation failure must never strand the UI — snap to
-        // the authoritative state instead (the old code left the shooter at
-        // "Simulating…" forever when playKeyframes returned false/threw).
-        let played = false;
-        try {
-          played = game.playKeyframes(msg.keyframes, applyAfter);
-        } catch (err) {
-          console.error('[pyramid] keyframe animation failed — snapping', err);
-        }
-        if (!played || !game.isAnimating()) {
-          applyAfter(); // no animation / hidden-tab fast path already finished
-        }
+      // Step 11: no keyframes travel the wire. If pocket-drop animations are
+      // still draining locally (sub-second cosmetics), let them finish so a
+      // respotted ball does not snap back mid-drop.
+      if (game && game.isAnimating()) {
+        const drain = () => {
+          if (!game.isAnimating()) applyAfter();
+          else setTimeout(drain, 50);
+        };
+        drain();
       } else {
         applyAfter();
       }
@@ -806,7 +789,7 @@ function onMessage(msg) {
     case 'cue_placed': {
       const apply = () => {
         if (state.balls) state.balls.cue = { x: msg.x, y: msg.y };
-        PYRAMID()?.setBallPositions({ cue: { x: msg.x, y: msg.y } });
+        PYRAMID()?.setBallPositions({ cue: { x: msg.x, y: msg.y } }, { partial: true });
         PYRAMID()?.setAim(state.aimPhi);
       };
       if (PYRAMID()?.isAnimating()) {
@@ -824,7 +807,6 @@ function onMessage(msg) {
       state.chipEls = null;
       state.practice = false;
       disarmShotWatchdog();
-      stopSimTicker();
       stopHudClock();
       els.hud.hidden = true;
       els.lobby.classList.remove('playing');
@@ -847,7 +829,6 @@ function onMessage(msg) {
       }
       state.shotInFlight = false;
       disarmShotWatchdog();
-      stopSimTicker();
       updateControls();
       break;
     default:
@@ -922,7 +903,6 @@ function resetToEntry() {
   state.practicePending = false;
   state.charging = false;
   disarmShotWatchdog();
-  stopSimTicker();
   stopHudClock();
   els.hud.hidden = true;
   els.toast.hidden = true;

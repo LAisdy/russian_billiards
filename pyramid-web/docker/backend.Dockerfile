@@ -1,5 +1,8 @@
-# pyramid-web backend — FastAPI service wrapping the vendored pooltool
-# physics engine. MULTI-STAGE build:
+# pyramid-web backend — FastAPI service for the multiplayer Russian Pyramid
+# game. Since Step 11 the REAL-TIME physics runs in the player's browser
+# (frontend/physics.js, vendored cannon-es); this service only judges client-
+# reported terminal states with the vendored pooltool RULESETS (pure Python,
+# microseconds) and serves the UI + REST + WebSocket. MULTI-STAGE build:
 #
 #   stage 1 (builder) — install the pinned dependency stack into a clean
 #                       virtualenv at /opt/venv
@@ -31,21 +34,20 @@ FROM python:3.12-slim AS runtime
 # PYTHONHASHSEED=0: layouts.py assigns rack ball IDs via
 # random.choice(list(<set of str>)); a fixed hash seed makes seeded racks
 # reproducible across processes/restarts (see app/physics.py docstring).
-# PYTHONDONTWRITEBYTECODE=1 keeps the image layers clean of stray .pyc;
-# numba's own .nbc JIT cache (decision #14) still persists in __pycache__.
+# PYTHONDONTWRITEBYTECODE=1 keeps the image layers clean of stray .pyc.
 # PYRAMID_STATIC_DIR: app/main.py serves this frontend copy at "/" (gzip on),
 # so ONE container exposes UI + REST + WS on one origin — the single-service
 # deployment shape used on render.com. docker-compose keeps nginx in front
 # (its copy is authoritative there); serving the tree twice is harmless.
-# NUMBA_CPU_NAME=generic: the JIT disk cache is BAKED at build time (below),
-# and the build box's CPU is never the run fleet's CPU — a host-specific
-# compile could embed instructions the runtime CPU lacks. "generic" targets
-# baseline x86-64 (portable everywhere; the ~75-190 ms steady-state shot
-# budget tolerates the few-percent codegen cost).
+# PYRAMID_WARMUP=0 (Step 11): gameplay never touches pooltool physics (the
+# client's JS engine simulates strokes; the server only judges terminal
+# states with the pure-Python rulesets), so the 25-30 s numba JIT warmup
+# would burn free-tier CPU for nothing. The REST /api/shot test endpoint
+# stays available but cold; set PYRAMID_WARMUP=1 to re-enable the warmup.
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PYTHONHASHSEED=0 \
-    NUMBA_CPU_NAME=generic \
+    PYRAMID_WARMUP=0 \
     PYRAMID_STATIC_DIR=/app/static \
     PATH="/opt/venv/bin:$PATH"
 
@@ -62,38 +64,24 @@ WORKDIR /app
 # Virtualenv with the full dependency stack from the builder stage.
 COPY --from=builder /opt/venv /opt/venv
 
-# Application code + the vendored pooltool physics package (byte-identical
-# copy of the source repo — provenance and diff policy in
-# backend/pooltool/VENDORED.md). Importable as top-level `pooltool` because
-# WORKDIR /app is on sys.path (uvicorn's --app-dir default).
+# Application code + the vendored pooltool package (rulesets only on the
+# gameplay path since Step 11; physics kept for the REST test endpoint —
+# provenance and diff policy in backend/pooltool/VENDORED.md). Importable as
+# top-level `pooltool` because WORKDIR /app is on sys.path (uvicorn's
+# --app-dir default).
 COPY backend/app ./app
 COPY backend/pooltool ./pooltool
 COPY frontend ./static
 
-# Step 10 (A3): BAKE the numba JIT disk cache into the image. .dockerignore
-# excludes **/__pycache__/** and **/*.nbc from the build context, so every
-# fresh container used to recompile the full 3D kernel set from scratch —
-# ~25 s on a fast box, potentially MINUTES on the free tier's throttled
-# shared CPU with 512 MB. A shot arriving before warmup finished blocked the
-# whole receive loop for that long ("cue disappears, balls never move, the
-# opponent's screen freezes" — the render.com field report). Running the
-# warmup here (as root, before chown/USER) writes the .nbc set next to the
-# vendored sources so containers start with a WARM engine; the chown below
-# keeps the cache directory writable for any later runtime recompiles. If
-# numba ever rejects the baked entries it silently recompiles — no worse
-# than before, and now observable via the shot lifecycle logs (A1).
-RUN /opt/venv/bin/python -c "from app import physics; physics.warmup(); assert physics.warm_ready(), 'JIT warmup did not reach ready state'"
-
-# Non-root runtime; /app is chowned so numba's JIT disk cache (written next
-# to the vendored sources) survives container restarts instead of silently
-# disabling itself on a read-only path.
+# Non-root runtime; /app is chowned so any opt-in runtime warmup (see
+# PYRAMID_WARMUP above) can still write its cache next to the sources.
 RUN chown -R appuser:appuser /app
 USER appuser
 
 EXPOSE 8000
 
 # --reload is intentionally off: this is the production container. The app
-# must run as a SINGLE worker process (in-memory lobby state + numba cache).
+# must run as a SINGLE worker process (in-memory lobby state).
 #
 # Shell-form CMD so the port is configurable at run time:
 #   - render.com injects PORT (default 10000) and requires the service to

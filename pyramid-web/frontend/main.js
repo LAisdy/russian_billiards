@@ -23,6 +23,13 @@
 //         viewport aspect (ui_math.js) with smooth cubic tweens, user-input
 //         cancellation, resize re-framing and localStorage persistence —
 //         the table stays in frame at every aspect ratio.
+// Step 11 (architecture change — client-side JS physics): the stroke is
+//         simulated IN THE BROWSER by physics.js (vendored cannon-es): the
+//         shooter watches the real ball motion at 60 FPS with zero server
+//         wait, pocketed balls drop into the wells via trigger-zone capture,
+//         and only the final resting state + game events go to the server
+//         (the old server-keyframe player is gone — "Simulating…" can no
+//         longer exist).
 //
 // Every table dimension below is taken from the pooltool physics spec, so
 // what you see is what the engine simulates against:
@@ -48,6 +55,7 @@ import {
   fitDistance,
   topViewDistance,
 } from './ui_math.js';
+import { POCKETS, PyramidPhysics } from './physics.js';
 
 // --- equipment constants (pooltool RUSSIAN_PYRAMID_GENERIC) -------------------
 const L = 3.7; // table length (m)
@@ -667,16 +675,28 @@ cueMesh.receiveShadow = true;
 ballMeshes.set('cue', cueMesh);
 scene.add(cueMesh);
 
-// pooltool (x, y) -> scene position. Placing a ball also makes it visible:
-// a respotted ball (foul pot, «с руки» placement) reappears after the shot
-// animation hid the pocketed ones.
-const setBallPositions = (positions) => {
+// pooltool (x, y) -> scene position, and the authoritative state that drives
+// the physics world: a FULL update also hides balls absent from the payload
+// (pocketed/removed) and removes their bodies; a PARTIAL update (cue
+// placement) merges into the last full state.
+let worldPositions = {}; // id -> {x, y} pooltool coords (last full state)
+const setBallPositions = (positions, opts = {}) => {
+  const partial = Boolean(opts.partial);
+  if (!partial) worldPositions = {};
   for (const [id, pos] of Object.entries(positions)) {
     const mesh = ballMeshes.get(id);
     if (!mesh || typeof pos.x !== 'number' || typeof pos.y !== 'number') continue;
+    worldPositions[id] = { x: pos.x, y: pos.y };
     mesh.visible = true;
+    mesh.scale.set(1, 1, 1); // a respotted ball cancels any drop animation
     mesh.position.set(pos.y - L / 2, BALL_R, pos.x - W / 2);
   }
+  if (!partial) {
+    for (const [id, mesh] of ballMeshes) {
+      if (!worldPositions[id]) mesh.visible = false;
+    }
+  }
+  phys.syncBalls({ ...worldPositions });
 };
 
 // deterministic local fallback (same geometry as layouts.py) if the backend
@@ -730,12 +750,72 @@ fetch('/api/rack?seed=7') // fixed seed for a stable demo rack (game play re-rac
       `(rack: ${rackSource}) · pockets ${(PW * 1000).toFixed(1)}/${(SW * 1000).toFixed(1)} mm`;
   });
 
-// --- shot animation: server keyframes -> client interpolation (Step 5) ---------
-// The server samples the event-based trajectory onto a 40 ms grid plus every
-// event time, each keyframe being the EXACT physics state. This client
-// interpolates linearly between keyframes (never a per-tick stream) and snaps
-// to the authoritative final state, hiding pocketed balls on completion.
-let animState = null;
+// --- Step 11: client-side shot simulation ---------------------------------------
+// physics.js owns the stroke: beginShot() launches the cue ball, the render
+// loop advances the world in fixed 1 ms substeps and copies body poses onto
+// the meshes (real rolling, correct collisions, pocket trigger capture), and
+// when the balls come to rest the terminal report goes to the server.
+const phys = new PyramidPhysics();
+const POCKET_CENTERS = Object.fromEntries(
+  POCKETS.map(([id, x, y]) => [id, { x, y }]),
+);
+
+// pocket-drop animation: a captured ball visually falls into the well
+// (physics already removed its body the instant its center entered the
+// trigger zone — this is purely cosmetic).
+const fallAnims = [];
+const FALL_MS = 240;
+phys.onCapture = (info) => {
+  const mesh = ballMeshes.get(info.ball);
+  const well = POCKET_CENTERS[info.pocket];
+  if (!mesh || !well) return;
+  fallAnims.push({
+    mesh,
+    t0: performance.now(),
+    from: mesh.position.clone(),
+    toX: well.y - L / 2,
+    toZ: well.x - W / 2,
+  });
+};
+
+const stepPocketFalls = () => {
+  for (let i = fallAnims.length - 1; i >= 0; i--) {
+    const f = fallAnims[i];
+    const u = Math.min(1, (performance.now() - f.t0) / FALL_MS);
+    const e = u * u; // ease-in: the drop accelerates
+    f.mesh.position.x = f.from.x + (f.toX - f.from.x) * e;
+    f.mesh.position.z = f.from.z + (f.toZ - f.from.z) * e;
+    f.mesh.position.y = BALL_R - (BALL_R + 0.05) * e;
+    const s = 1 - 0.35 * e;
+    f.mesh.scale.set(s, s, s);
+    if (u >= 1) {
+      f.mesh.visible = false;
+      f.mesh.scale.set(1, 1, 1);
+      fallAnims.splice(i, 1);
+    }
+  }
+};
+
+// per-frame physics stepping + mesh pose copy (60 FPS animation of the real
+// simulation — the shooter watches the actual ball motion, not an replay)
+const stepPhysicsShot = () => {
+  phys.step(lastFrameDtMs);
+  for (const [id, body] of phys.ballBodies) {
+    const mesh = ballMeshes.get(id);
+    if (!mesh) continue;
+    mesh.position.set(
+      body.position.z - L / 2,
+      body.position.y,
+      body.position.x - W / 2,
+    );
+    mesh.quaternion.set(
+      body.quaternion.x,
+      body.quaternion.y,
+      body.quaternion.z,
+      body.quaternion.w,
+    );
+  }
+};
 
 const aimLine = (() => {
   const geo = new THREE.BufferGeometry();
@@ -767,7 +847,7 @@ const shortestArc = (d) =>
 
 const redrawAim = () => {
   const cue = ballMeshes.get('cue');
-  if (!cue || animState) return;
+  if (!cue || phys.simulating) return;
   const p = cue.position;
   // pooltool direction (cos φ, sin φ) in (x, y) -> world (X = y, Z = x)
   const dX = Math.sin(aimCur);
@@ -790,7 +870,7 @@ const redrawAim = () => {
 
 // per-frame aim easing; also repaints while charging (stick pull follows)
 const stepAim = (dtMs) => {
-  if (animState) return;
+  if (phys.simulating) return;
   if (chargePct !== null) {
     redrawAim();
     return;
@@ -811,7 +891,7 @@ const stepAim = (dtMs) => {
 };
 
 const setAim = (phiRad) => {
-  if (phiRad === null || phiRad === undefined || animState) {
+  if (phiRad === null || phiRad === undefined || phys.simulating) {
     aimLine.visible = false;
     if (!strikeState) cueStick.visible = false; // never kill a live strike
     return;
@@ -821,7 +901,7 @@ const setAim = (phiRad) => {
 };
 
 const setAimTarget = (phiRad) => {
-  if (phiRad === null || phiRad === undefined || animState) return;
+  if (phiRad === null || phiRad === undefined || phys.simulating) return;
   aimTgt = ((phiRad % (2 * Math.PI)) + 2 * Math.PI) % (2 * Math.PI);
 };
 
@@ -831,19 +911,18 @@ const setCueCharge = (pct) => {
     pct === null || pct === undefined
       ? null
       : Math.max(0, Math.min(100, Number(pct) || 0));
-  if (animState) return;
+  if (phys.simulating) return;
   if (chargePct !== null) redrawAim();
   else if (!strikeState) placeStick(aimCur, CUE_REST_PULLBACK);
 };
 
 const currentAim = () => aimCur;
 
-// --- cue stick: aim visual + optimistic strike feedback (Step 7) ----------------
-// The stroke itself stays server-authoritative (keyframes animate the real
-// physics); the stick only gives INSTANT local feedback the moment Shoot is
-// pressed, so the client never stares at a frozen scene waiting for the
-// simulation. A lunge into the ball (130 ms, accelerating), a short
-// follow-through past contact, then a fade.
+// --- cue stick: aim visual + strike feedback (Step 7/11) -------------------------
+// The stroke itself is local now (physics.js animates the real motion); the
+// stick still gives the instant lunge the moment Shoot is pressed, in sync
+// with the balls it just launched. A lunge into the ball (130 ms,
+// accelerating), a short follow-through past contact, then a fade.
 const CUE_REST_PULLBACK = 0.09; // resting tip gap behind the cue ball (m)
 const STRIKE_LUNGE_MS = 130;
 const STRIKE_FADE_MS = 250;
@@ -948,91 +1027,35 @@ const tablePoint = (clientX, clientY) => {
   return { x: px, y: py };
 };
 
-const finishAnimation = () => {
-  const a = animState;
-  const last = a.frames[a.frames.length - 1];
-  for (let i = 0; i < a.ids.length; i++) {
-    const mesh = ballMeshes.get(a.ids[i]);
-    if (!mesh) continue;
-    mesh.position.set(last[2 + 2 * i] - L / 2, BALL_R, last[1 + 2 * i] - W / 2);
+/** Launch a stroke: local physics starts NOW, the onDone callback receives
+ * the terminal report (final positions + pocketed + events) when all balls
+ * stop. Returns false while another shot is running or no cue ball exists. */
+const beginShot = (v0, phiRad, onDone) => {
+  if (phys.simulating) return false;
+  phys.onDone = typeof onDone === 'function' ? onDone : null;
+  const started = phys.beginShot(v0, phiRad);
+  if (started) {
+    aimLine.visible = false;
+    strikeState = null;
+  } else {
+    phys.onDone = null;
   }
-  for (const id of a.pocketed) {
-    const mesh = ballMeshes.get(id);
-    if (mesh) mesh.visible = false;
-  }
-  animState = null;
-  if (a.onDone) a.onDone();
-};
-
-const stepAnimation = () => {
-  const a = animState;
-  const now = performance.now() - a.t0;
-  const times = a.times;
-  const n = times.length;
-  if (now >= times[n - 1]) {
-    finishAnimation();
-    return;
-  }
-  // binary search: times[lo] <= now < times[hi]
-  let lo = 0;
-  let hi = n - 1;
-  while (lo + 1 < hi) {
-    const mid = (lo + hi) >> 1;
-    if (times[mid] <= now) lo = mid;
-    else hi = mid;
-  }
-  const t0 = times[lo];
-  const t1 = times[hi];
-  const u = t1 > t0 ? (now - t0) / (t1 - t0) : 0;
-  const f0 = a.frames[lo];
-  const f1 = a.frames[hi];
-  for (let i = 0; i < a.ids.length; i++) {
-    const mesh = ballMeshes.get(a.ids[i]);
-    if (!mesh) continue;
-    const o = 1 + 2 * i;
-    const px = f0[o] + (f1[o] - f0[o]) * u; // pooltool x
-    const py = f0[o + 1] + (f1[o + 1] - f0[o + 1]) * u; // pooltool y
-    mesh.position.set(py - L / 2, BALL_R, px - W / 2);
-  }
-};
-
-const playKeyframes = (kf, onDone) => {
-  if (
-    !kf ||
-    !Array.isArray(kf.ids) ||
-    !Array.isArray(kf.frames) ||
-    kf.frames.length < 2
-  ) {
-    return false;
-  }
-  if (animState) finishAnimation(); // a new shot supersedes a running one
-  animState = {
-    ids: kf.ids,
-    frames: kf.frames,
-    times: kf.frames.map((row) => row[0]),
-    pocketed: Array.isArray(kf.pocketed) ? kf.pocketed : [],
-    t0: performance.now(),
-    onDone: typeof onDone === 'function' ? onDone : null,
-  };
-  aimLine.visible = false;
-  cueStick.visible = false;
-  strikeState = null;
-  if (document.hidden) {
-    // A hidden tab cannot render: jump to the authoritative final state so
-    // positions are correct the moment the tab returns.
-    finishAnimation();
-  }
-  return true;
+  return started;
 };
 
 document.addEventListener('visibilitychange', () => {
-  if (!document.hidden && animState) finishAnimation();
+  // A hidden tab cannot render (and its rAF loop stops): fast-forward the
+  // simulation so the shot still resolves and the report still goes out.
+  if (document.hidden && phys.simulating) phys.fastForward();
 });
 
 const showAllBalls = () => {
-  animState = null;
+  fallAnims.length = 0;
   aimLine.visible = false;
-  for (const mesh of ballMeshes.values()) mesh.visible = true;
+  for (const mesh of ballMeshes.values()) {
+    mesh.visible = true;
+    mesh.scale.set(1, 1, 1);
+  }
 };
 
 // --- Step 8: camera presets, smooth switching, aspect-safe framing --------------
@@ -1204,10 +1227,12 @@ window.addEventListener('resize', () => {
 });
 
 let lastFrameMs = performance.now();
+let lastFrameDtMs = 16.6;
 renderer.setAnimationLoop(() => {
   const now = performance.now();
   const dtMs = Math.min(100, now - lastFrameMs); // clamp tab-switch spikes
   lastFrameMs = now;
+  lastFrameDtMs = dtMs;
   if (camTween) stepCamTween();
   if (cueCamFollow && !camTween) {
     const cue = ballMeshes.get('cue');
@@ -1221,7 +1246,8 @@ renderer.setAnimationLoop(() => {
   }
   controls.update();
   stepAim(dtMs);
-  if (animState) stepAnimation();
+  if (phys.simulating) stepPhysicsShot();
+  stepPocketFalls();
   if (strikeState) stepCueStrike();
   renderer.render(scene, camera);
 });
@@ -1330,8 +1356,10 @@ window.__pyramid = {
     return out;
   },
   setBallPositions,
-  playKeyframes,
-  isAnimating: () => animState !== null,
+  beginShot,
+  isAnimating: () => phys.simulating || fallAnims.length > 0,
+  physicsBusy: () => phys.simulating,
+  physicsResult: () => phys.result(),
   playCueStrike,
   stickVisible: () => cueStick.visible,
   setAim,

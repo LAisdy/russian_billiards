@@ -1673,3 +1673,88 @@ close out the "16-second shot" field report):
 - Hygiene: cleared the stray executable bit on `backend/app/*.py` and sorted
   `app/physics.py` imports (ruff `--fix`); `ruff check app` now fully clean;
   module re-import verified. `download/pooltool_russian.zip` refreshed.
+
+### Step 11 — ARCHITECTURE CHANGE: client-side JS physics (2026-11-02)
+
+Triggered by the render.com field report: even with every Step 10 fix (baked
+JIT cache, async dispatch, pruned keyframes) a real shot on the free tier took
+**67 seconds** — pooltool's Python physics is fundamentally too heavy for
+real-time play on a throttled shared CPU. Decision (user-approved): **the
+server no longer runs any physics for gameplay**. Real-time simulation moved
+into the shooter's browser; the server keeps only rules authority.
+
+**New flow.** Shoot → `frontend/physics.js` (vendored cannon-es 0.20.0,
+planar billiards world) simulates the stroke instantly and animates the REAL
+ball motion at 60 FPS → when the balls stop, ONE `shot` message goes to the
+server: final resting positions + `pocketed` (capture events with pocket ids)
++ `first_contact` + per-ball cushion-segment contacts + per-ball y-extremes
+→ `app/bridge.py` validates it, reconstructs the SYNTHETIC pooltool `System`
+(pre-shot history = the server's own state, final states, compact events
+with real segment/pocket ids) and the frozen rulesets judge it synchronously
+(microseconds — no numba, no worker thread) → `shot_result` broadcast with
+the authoritative post-rules state, **no keyframes on the wire**. The
+shooter's local view is corrected by the verdict (respots / penalty
+removals); the opponent's board snaps to the final state instantly.
+
+**The pocket fix (user requirement, regression-tested).** Pockets contain NO
+solid colliders. Each of the 6 wells has an invisible trigger zone (cannon-es
+sensor body, `collisionResponse = false`, radius 55 mm ≈ well radius + margin,
+centered on the well) — the moment a ball's CENTER enters the zone it is
+marked pocketed, its body is removed from the world and the mesh plays a
+240 ms drop animation. A ball can therefore never rest half-inside a pocket
+or jam in the well geometry. Defenses in depth: a per-substep analytic
+center-distance check duplicates the sensor events (tunneling-proof at the
+1 ms fixed step), and invisible back walls behind every well guarantee no
+ball can ever escape the world. Trigger-zone sizing is verified against the
+worst legal rest positions (jaws ≥ 65 mm out are safe; rail-huggers at
+65–84 mm are never falsely captured).
+
+**Table fidelity.** All 18 linear cushion segments and 12 circular jaw arcs
+of the pooltool spec are replicated as static colliders with their REAL ids
+(cushion-contact events reported to the rulesets use the same segment ids as
+pooltool). Balls: Ø 67 mm, 0.255 kg; ball-ball e=0.94; cushion e=0.72;
+cloth = constant 0.75 m/s² deceleration; rolling visual ω = (v × up)/R;
+fixed 1 ms timestep ⇒ deterministic (bit-identical repeat shots, battery-
+proven). One geometry bug was caught by the physics battery during
+development: the corner-jaw colliders used a centroid-based normal test that
+picks the wrong side for 45° segments — balls bounced out of pockets; fixed
+with a boundary/nearest-well rule and locked by tests.
+
+**Server changes.** `app/bridge.py` (new): report validation (ball-set
+conservation, geometry, real pocket/segment ids) + synthetic System
+construction + `process_and_advance`. `app/lobby.py`: `shot` rewritten —
+synchronous judging, no `shot_busy`, no `shot_task`, no `shot_ack`, no
+`engine_status`; practice path keeps the frozen-rules policy untouched.
+`app/physics.py`: pooltool physics now only serves the REST test endpoint;
+warmup skippable via `PYRAMID_WARMUP=0`. `docker/backend.Dockerfile`: JIT
+bake RUN removed, `PYRAMID_WARMUP=0` baked — free-tier CPU stays cool and
+builds are faster. `frontend/main.js`: render loop steps the physics world
+and copies body poses onto the meshes (real rolling quaternions), keyframe
+player removed, hidden-tab fast-forward. `frontend/lobby.js`: sendShot runs
+the local physics and sends the terminal report; "Simulating…" ticker and
+multi-stage watchdog deleted — a shot can never block the UI again.
+
+**Verification (all green).**
+- `scripts/test_client_physics.mjs` (Node, headless): **44/44** — full-power
+  break invariants (quiescence, no escapes, no overlaps, no NaN), capture in
+  all 6 pockets with correct ids, **never-stuck invariant** (no live ball
+  rests inside a trigger zone), rail-hugger not falsely captured, slow
+  roll-into-mouth ALWAYS captured (the reported bug scenario), jaw-rattle
+  safety, bit-identical determinism, syncBalls respot/removal semantics,
+  fastForward ≡ stepped sim.
+- `scripts/verify_step11_client_physics.py` (live uvicorn, real WS): **32/32**
+  — legal pot on the break (score, continuation, ball gone), no-contact foul
+  (opponent +1, «штрафной шар» removed, turn passes), out-of-turn rejection,
+  4 malformed-report rejections with room state intact, scratch without
+  contact (house respot + behind-line ball-in-hand), practice pot/scratch/
+  place_cue/re-rack, protocol hygiene (no keyframes/sim fields, judge_ms
+  present, snapshot rides the verdict).
+- `node --check` physics.js/main.js/lobby.js PASS; `ruff check app` clean;
+  static serving of `/physics.js` + `/vendor/cannon-es.js` verified on a live
+  server; `/api/health` reports `physics_ready: true` with the warmup
+  disabled. Battery caught two integration bugs during development (pooltool
+  seeds no history on `Ball.create`; outcome dict shape) — both fixed.
+- Anti-cheat note: the server validates report geometry and ball-set
+  conservation but trusts the shooting client's outcomes; server-side
+  re-simulation as anti-cheat is deliberately out of scope (it would
+  reintroduce the cost this step removes).
