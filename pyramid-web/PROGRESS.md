@@ -1428,3 +1428,225 @@ acceptance checks green. Deliverable: download/pooltool_russian.zip
 refreshed below (workspace snapshot incl. this addendum).
 
 Stopped — awaiting the user's review / render.com deploy attempt.
+
+--------------------------------------------------------------------------------
+
+## Step 10 — Post-deployment gameplay fixes (render.com field report)
+
+**2026-10-31 ~13:40 MSK — status: PLAN APPROVAL PENDING (user gate before Step A code).**
+
+The render.com deployment is LIVE, but playtesting surfaced three critical
+issues. The user ordered them into a fix pipeline and asked for a diagnosis
+plan first (pause before implementation):
+
+- **Issue 1 — aiming UX unusable.** Current scheme is click-to-aim (a click
+  on the felt snaps the cue to that angle) + a power slider + a Shoot
+  button. Wanted ("Panda3D-style"): mouse-move (no buttons) rotates the cue
+  around the cue ball smoothly; left-drag charges power (pull back) and
+  release shoots; camera orbits the cue ball via drag.
+- **Issue 2 — shooting completely broken on the deployment.** Click Shoot →
+  cue stick fades (the optimistic Step 7 strike plays) → ball never moves →
+  the opponent's screen freezes waiting for `shot_result` that never
+  applies. Requested debugging task: extensive logging both sides, verify
+  the WS payload contract, catch silent server exceptions.
+- **Issue 3 — no single-player practice mode** («Тренировка»): the lobby
+  hard-requires 2 players; needed: instant solo entry, turn-switching
+  bypassed, free shooting, cue-ball respot after a scratch.
+
+### Diagnosis evidence gathered so far (sandbox, no browser E2E per rule)
+
+- NEW `scripts/probe_shot_issue.py` — drives the EXACT client flow over a
+  real WS connection (create → join → start free game → break place_cue →
+  shot → shot_result → second player's shot). Result on this sandbox:
+  **backend shot path works end-to-end** (break: 1.4 s round-trip incl.
+  cold-path JIT load, 360 keyframes / 557 events; follow-up shot: 129 ms,
+  269 frames; verdicts, turn rotation and both-client broadcasts all
+  correct). So the "ball doesn't move" failure is NOT a plain protocol
+  regression in the current tree — it is environment- or client-side.
+- **Cold-JIT landmine (prime suspect for Render):** `.dockerignore`
+  excludes `**/__pycache__/` and `**/*.nbc`, and the numba disk cache lives
+  exactly there (122 .nbc files, ~11 MB in a warm tree;
+  `constants.use_numba_cache = True`). Therefore every Render container
+  start (deploy, restart, 15-min-idle wake) recompiles the full 3D kernel
+  set from scratch — ~25 s on a fast box, potentially minutes on the free
+  tier's throttled shared CPU with 512 MB. A shot arriving before warmup
+  finishes either blocks for that long inside `asyncio.to_thread` (the
+  "Simulating…" ticker climbing, both screens frozen) or OOMs the
+  container. The Dockerfile comment claims the cache survives restarts —
+  true only within one container, false for every fresh container.
+- **Silent server errors:** in-game server `error` replies land in
+  `#lobby-msg` (bottom of the side panel) via `showMsg` — easy to miss;
+  `invalid_shot` (incl. every physics/ruleset rejection converted by
+  `run_shot_keyframes`) and `not_your_turn` therefore LOOK like "nothing
+  happened". Backend-side, `PhysicsError` conversions drop the traceback
+  (only `logger.exception` covers the defensive `Exception` branch), and
+  app-level `logger.info` never reaches the console because uvicorn
+  configures only its own loggers (no root handler → INFO dropped).
+  Client-side, `ws.onmessage` wraps `JSON.parse` AND the whole handler in
+  one try/catch labeled "unparseable message" — a handler exception inside
+  e.g. `playKeyframes`/`applyGameState` would freeze BOTH clients
+  identically (each runs the same broadcast handler) and only log to the
+  console.
+- **Pocketed balls are never hidden:** the server's keyframes payload has
+  no `pocketed` key, so the client's `playKeyframes` stores `a.pocketed=[]`
+  and `finishAnimation`'s hide-loop never fires; `setBallPositions` only
+  touches ids present in the post-shot dict, so potted ball meshes stay
+  visible at the pocket mouth. One-line server fix (add `pocketed` to the
+  keyframes dict — client support already shipped in Step 5).
+- **Ball-in-hand click hijack (feeds Issue 1 confusion):** on the break
+  `ball_in_hand=behind_line` → `state.placingCue=true` → EVERY table click
+  sends `place_cue` instead of aiming (and clicking the pyramid half is
+  rejected server-side with an easy-to-miss `invalid_placement`). Aiming
+  at all requires discovering the small «Placing cue ball» toggle.
+
+### Task plan (user-ordered execution)
+
+- **Step A (first): make shooting work + observable.**
+  A1 Backend logging: `logging.basicConfig` so app INFO reaches Render
+  logs; structured shot lifecycle logs (params → sim start → sim_ms →
+  keyframes size → verdict → broadcast bytes) with full tracebacks on
+  physics/ruleset rejections; loud warning + client `engine_status`
+  broadcast when a shot arrives while `physics.warm_ready()` is False.
+  A2 Frontend logging + error surfacing: console payload dump before
+  send; per-WS-message log (type + size); separate parse vs handler
+  errors in `onmessage`; `window.onerror`/`unhandledrejection` hooks;
+  server errors shown in the game hint + toast, not only `#lobby-msg`;
+  shot watchdog (no `shot_result` in 10 s → "engine may be warming up"
+  hint; keeps waiting). Health poll shows `physics_ready` state.
+  A3 Ship the JIT cache in the image: runtime-stage `RUN` warmup
+  (`physics.warmup()` + `warm_ready()` assert) BEFORE `chown`/`USER`, so
+  the .nbc set (~11 MB) bakes into the layer; if Render's CPU ever
+  rejects the baked cache numba falls back to compiling — no worse than
+  today, and now visible via A1/A2.
+  A4 `pocketed` added to the keyframes payload (fixes ball hiding).
+- **Step B: Panda3D-style aiming.** Input state machine in main.js +
+  lobby.js: (1) pointermove (no buttons, my turn, not placing) → aim
+  target phi from cue ball to cursor's table-plane point, smoothed
+  exponentially per render frame (stick + aim line sweep, no snap);
+  (2) LMB press-drag = power charge (vertical pull maps 1..100 %,
+  stick pulls back visually, release < 1 % cancels, release otherwise
+  shoots with the live aim), slider stays synced + functional;
+  (3) camera orbit around the cue ball: OrbitControls retargeted (lerped)
+  to the cue ball during your turn, RIGHT-drag rotates / wheel zooms
+  (LEFT freed for charging; touch: one-finger aims, two-finger orbits);
+  ESC cancels charging; `__pyramidGame.shoot()` test hook preserved.
+- **Step C: practice mode.** New `{"type": "practice"}` protocol message →
+  solo room (still code-addressable), mode `practice`, game starts
+  instantly with one player. Lobby-level pseudo-ruleset (vendored rulesets
+  stay frozen; `run_shot_keyframes(game=None)` + app-level post-processing
+  in lobby.py): turn never passes, no calls, no fouls, potted balls stay
+  pocketed, scratch → cue auto-respotted at the house default (deterministic
+  nudge, mirrors the vendored policy on plain dicts) + ball-in-hand
+  anywhere granted; snapshot reports `practice` mode, no game-over ever;
+  «Re-rack» control (host = the only player). Lobby entry gets a
+  Practice / «Тренировка» button; the game UI is reused unchanged.
+- **Step D: verification + docs + zip.** Extend the WS probe into a full
+  Step A/C acceptance battery (shot lifecycle incl. warming-path message,
+  error visibility contract, practice-mode protocol); update
+  verify_step9_docker.py for the baked-cache build contract; node --check
+  on touched JS; PROGRESS.md closure; refresh download/pooltool_russian.zip.
+
+**Checkpoint: plan presented to the user — implementation starts on «NEXT».**
+
+### Step 10 implementation record — COMPLETE (2026-11-01, user «NEXT» received)
+
+All four planned work items implemented and verified. Backend version bumped
+0.7.0 → 0.8.0.
+
+**Step A — shooting works + is observable.**
+- A1 backend logging: `logging.basicConfig` in `app/main.py` (uvicorn only
+  configures its own loggers — app INFO used to vanish); shot lifecycle logs
+  (`shot #N accepted room=… v0=… engine_warm=…` → `simulated … wall=…s
+  frames=… bytes=…` → `shot_result #N broadcast … to N player(s)`); physics/
+  ruleset rejections now log full tracebacks (A1 `logger.warning(exc_info)`);
+  the in-room WS loop catches non-LobbyError exceptions, logs them, tells the
+  client (`internal_error`) and KEEPS THE SOCKET ALIVE (the old code silently
+  killed the loop and stranded the shooter).
+- A2 frontend logging + surfacing: `[pyramid]`-prefixed console logs (payload
+  dump on send, per-message handler logs, watchdog stages, server errors);
+  `window.onerror`/`unhandledrejection` hooks; parse errors separated from
+  handler errors in `onmessage` (one try/catch used to mask both); server
+  `error` messages now surface in the toast + game hint (not only the hidden
+  `#lobby-msg`); shot watchdog (10 s / 30 s / 90 s escalating "engine may be
+  warming up" hints, keeps waiting — server stays authoritative); HUD health
+  line shows `engine ready|warming`.
+- A3 Dockerfile bakes the numba JIT cache: new runtime-stage `RUN …
+  physics.warmup(); assert physics.warm_ready()` before `chown`/`USER`, plus
+  `ENV NUMBA_CPU_NAME=generic` so the baked machine code is portable across
+  the deploy fleet's CPUs. Fresh containers now start with a WARM engine
+  (cold path only recompiles if numba rejects the baked entries — observable
+  via A1/A2). Local proof: warmup from the disk cache = 2.3 s; steady-state
+  shots 19–75 ms.
+- A4 `pocketed` added to the keyframes payload (`app/physics.py`) — potted
+  ball meshes are hidden again at animation end (client support existed
+  since Step 5; the key was simply never sent).
+- **Non-blocking shot dispatch** (beyond-plan hardening): `lobby.shot()` now
+  validates, immediately replies `shot_ack` (+ an `engine_status` broadcast
+  when `physics.warm_ready()` is False), and dispatches the simulation as an
+  `asyncio.create_task`. The receive loops of BOTH sockets stay responsive
+  during long cold-JIT sims — keepalive pings keep flowing, so idle-timeout
+  infrastructure can no longer reap a mid-shot connection. Stale results
+  (abort/rematch raced the simulation) are dropped by identity guard
+  (`room.game is not game_obj or room.shot_seq != shot_id`).
+
+**Step B — Panda3D-style aiming (main.js + lobby.js).**
+- Mousemove (no buttons, your turn, not placing) feeds an aim TARGET (cue
+  ball → cursor's table-plane point); the render loop eases the live angle
+  toward it exponentially (frame-rate independent, shortest-arc) — the stick
+  and aim line sweep instead of snapping. `setAim` stays the instant variant
+  (game start / cue placement / test hooks); `setAimTarget`/`currentAim` are
+  new API.
+- LMB press-drag = power charge: vertical pull maps onto the existing power
+  slider (1..100 %, synced + still functional), the stick pulls back visually
+  (up to +0.35 m), the strike lunge launches from the charged position;
+  release < 2 % (or a tap, or Esc) cancels; any other release shoots the live
+  smoothed aim. Charge start is captured in the DOCUMENT capture phase and
+  `stopPropagation()`s — OrbitControls never sees the drag.
+- Camera: during your turn OrbitControls' LEFT button (and one-finger touch)
+  is freed for charging; orbit moved to RIGHT-drag (touch: two fingers), and
+  the orbit target lerps onto the cue ball (`setCueCamFollow`) so orbiting
+  inspects the actual stroke position. Camera presets keep working (follow
+  re-centers from each preset; tween frames suppress the follow lerp).
+- Ball-in-hand placement is now the ONLY thing a table click does (and only
+  while `placingCue`) — the break's click hijack is gone. Touch: one-finger
+  drag aims, two fingers orbit/zoom, slider + Shoot fire.
+- `__pyramidGame.shoot(angle, power)` E2E hook preserved.
+
+**Step C — practice mode («Тренировка»).**
+- New `{"type": "practice"}` protocol message (host-only): instant solo
+  start from the lobby entry button (create → auto-practice handshake) or
+  in-game Re-rack. `room.mode="practice"`, `room.practice=True`, ruleset
+  bypassed entirely (`run_shot_keyframes(game=None)` + lobby-level post-
+  processing on plain dicts — vendored rulesets untouched): turn never
+  passes, no calls/fouls, potted & jumped balls leave the table, scratch →
+  deterministic house respot (`_practice_place_cue`: vendored policy mirror
+  + grid fallback) + ball-in-hand anywhere grant; `place_cue` works there;
+  snapshot shape matches ruleset snapshots so the HUD renders unchanged
+  (`Practice («Тренировка») · first to 0`, solo player always the turn).
+  A joiner cannot enter a running session (join is refused while PLAYING)
+  and non-host shooting is soft-locked with a clear message.
+
+**Step D — verification + docs + zip.**
+- NEW `scripts/verify_step10_fixes.py`: WS-level acceptance battery against
+  a live uvicorn (no browser, per sandbox rule): **22/22 checks PASS** —
+  two-player lifecycle (ack → result on both clients, ping answered DURING
+  simulation, `pocketed` in keyframes, verdict propagation, follow-up shot),
+  error visibility (`not_your_turn` structured error), practice battery
+  (instant solo start, no turn passing, scratch → respot + anywhere grant,
+  place_cue accepted, re-rack). The battery caught one real bug during
+  development (practice shot ran `_apply_call` on the ruleset-less room →
+  AttributeError) — fixed (`if not room.practice`) and re-verified.
+- `verify_step9_docker.py` extended with the baked-cache contract (5 new
+  checks: bake RUN present + asserts ready + ordered before chown/USER +
+  `NUMBA_CPU_NAME=generic`) — **93/93 PASS**.
+- `verify_render_deploy.py` re-run: **46/46 PASS** (version check updated to
+  0.8.0).
+- `node --check` on main.js/lobby.js: PASS. `ruff check backend/app`: clean.
+- `download/pooltool_russian.zip` refreshed.
+
+**Deployment note for the next Render deploy:** the first build after this
+change takes longer (the bake RUN runs the full JIT warmup in the image),
+and every container start afterwards is WARM — the first shot animates in
+sub-second time instead of blocking minutes. If a deploy ever fails inside
+the bake RUN, the physics stack itself failed to compile — that failure is
+now visible at build time instead of at game time.

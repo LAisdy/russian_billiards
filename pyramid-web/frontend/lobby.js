@@ -29,6 +29,8 @@ const els = {
   modeGrid: document.getElementById('mode-grid'),
   modeNote: document.getElementById('mode-note'),
   start: document.getElementById('btn-start'),
+  practice: document.getElementById('btn-practice'),
+  rerack: document.getElementById('btn-rerack'),
   hint: document.getElementById('lobby-hint'),
   msg: document.getElementById('lobby-msg'),
   game: document.getElementById('lobby-game'),
@@ -62,7 +64,29 @@ const MODE_NAMES = {
   combined: 'Combined Pyramid',
   dynamic: 'Dynamic Pyramid',
   classic: 'Classic Pyramid',
+  practice: 'Practice',
 };
+
+// Step 10: shot watchdog stages — [delay_ms, message]. The client keeps
+// waiting (the server stays authoritative); these only keep the player
+// INFORMED instead of a silent frozen "Simulating…" ticker. A retry while
+// the server is genuinely busy returns the server's own shot_busy error.
+const WATCHDOG_STAGES = [
+  [
+    10000,
+    'Still no result — the physics engine may be warming up (the first shot '
+      + 'after a cold start can take a minute on free hosting).',
+  ],
+  [
+    30000,
+    'Still simulating — free-tier hosting can be slow on the first shot. '
+      + 'Waiting…',
+  ],
+  [
+    90000,
+    'Taking unusually long — the server may be under heavy load. Waiting…',
+  ],
+];
 
 const state = {
   ws: null,
@@ -77,6 +101,13 @@ const state = {
   game: null, // last server game snapshot (Step 6)
   placingCue: false, // table clicks place the cue ball (ball-in-hand)
   pendingCue: null, // cue_placed received mid-animation, applied after
+  // Step 10: practice («Тренировка») + input/watchdog state
+  practice: false, // the current game is a solo practice session
+  practicePending: false, // create → joined → practice handshake in flight
+  charging: false, // LMB power-charge drag in progress
+  chargeStartY: 0,
+  chargeStartPct: 0,
+  watchdogTimer: null,
   // Step 8 HUD
   clockOffsetMs: 0, // server now - client now at the last snapshot (skew fix)
   clockTimer: null, // 500 ms HUD clock ticker
@@ -162,14 +193,57 @@ function connect() {
       onClosed();
     };
     ws.onmessage = (ev) => {
+      let msg;
       try {
-        onMessage(JSON.parse(ev.data));
+        msg = JSON.parse(ev.data);
       } catch (err) {
-        console.error('unparseable message', err);
+        // parse errors and handler errors are SEPARATE (Step 10): one big
+        // try/catch used to mask handler bugs as "unparseable message".
+        console.error('[pyramid] unparseable WS message', err, ev.data);
+        return;
+      }
+      try {
+        onMessage(msg);
+      } catch (err) {
+        console.error(`[pyramid] handler failed for ${msg && msg.type}`, err);
+        showToast('UI error — see browser console');
       }
     };
     state.ws = ws;
   });
+}
+
+// Step 10 (A2): global error hooks — any UI crash lands in the console
+// with a [pyramid] prefix instead of vanishing.
+window.addEventListener('error', (ev) => {
+  console.error('[pyramid] window.onerror', ev.message, ev.filename, ev.lineno);
+});
+window.addEventListener('unhandledrejection', (ev) => {
+  console.error('[pyramid] unhandled rejection', ev.reason);
+});
+
+// --- Step 10: shot watchdog -------------------------------------------------------
+function armShotWatchdog() {
+  disarmShotWatchdog();
+  const fire = (i) => {
+    if (i >= WATCHDOG_STAGES.length) return;
+    const [delay, text] = WATCHDOG_STAGES[i];
+    state.watchdogTimer = setTimeout(() => {
+      if (!state.shotInFlight) return; // result arrived meanwhile
+      console.warn(`[pyramid] watchdog stage ${i} fired at`, Date.now() - state.shotSentAt, 'ms');
+      els.gameHint.textContent = text;
+      showToast('Still simulating…');
+      fire(i + 1);
+    }, delay);
+  };
+  fire(0);
+}
+
+function disarmShotWatchdog() {
+  if (state.watchdogTimer) {
+    clearTimeout(state.watchdogTimer);
+    state.watchdogTimer = null;
+  }
 }
 
 async function createRoom() {
@@ -178,6 +252,19 @@ async function createRoom() {
     const ws = await connect();
     ws.send(JSON.stringify({ type: 'create', name: readName() }));
   } catch (err) {
+    showMsg(`Cannot reach server: ${err.message}`);
+  }
+}
+
+// Step 10: instant solo entry — create a room, then start practice in it.
+async function startPractice() {
+  showMsg('');
+  state.practicePending = true;
+  try {
+    const ws = await connect();
+    ws.send(JSON.stringify({ type: 'create', name: readName() }));
+  } catch (err) {
+    state.practicePending = false;
     showMsg(`Cannot reach server: ${err.message}`);
   }
 }
@@ -419,9 +506,11 @@ function updateControls() {
   } else if (mine && state.placingCue) {
     hint = 'Ball in hand: click the table to place the cue ball.';
   } else if (mine && g && g.call_shot) {
-    hint = 'Call ball + pocket, click the table to aim, then shoot.';
+    hint = 'Call ball + pocket, move the mouse to aim, then shoot.';
   } else if (mine) {
-    hint = 'Click the table to aim, then shoot.';
+    hint =
+      'Move the mouse to aim · hold the LEFT button and pull back to charge '
+      + '· release to shoot. RIGHT-drag orbits the camera; Esc cancels.';
   } else {
     const who = g && g.turn ? g.turn.name : 'opponent';
     hint = `Waiting for ${who}…`;
@@ -459,6 +548,18 @@ function applyGameState() {
       : `Game over — tie ${finalScore}.`;
   }
   els.rematch.hidden = !(g.game_over && isHost());
+  // Step 10: practice gets a Re-rack control instead of the rematch flow.
+  els.rerack.hidden = !state.practice;
+  els.rerack.disabled = !mine;
+  // Step 10: hand the mouse to the player (LEFT = charge, camera on RIGHT)
+  // and let the camera orbit drift onto the cue ball during their turn.
+  const game = PYRAMID();
+  if (game && typeof game.setPlayerControl === 'function') {
+    game.setPlayerControl(mine);
+  }
+  if (game && typeof game.setCueCamFollow === 'function') {
+    game.setCueCamFollow(mine && !gameOver);
+  }
   updateControls();
 }
 
@@ -478,31 +579,47 @@ function verdictText(msg) {
 }
 
 function sendShot() {
-  if (!state.ws || state.ws.readyState !== WebSocket.OPEN) return;
+  if (!state.ws || state.ws.readyState !== WebSocket.OPEN) {
+    showToast('Not connected.');
+    return;
+  }
   if (state.shotInFlight) return;
   const game = PYRAMID();
   if (game && game.isAnimating()) return; // previous stroke still animating
   if (!myTurn()) {
-    showMsg('It is not your turn.');
+    showToast('It is not your turn.');
     return;
   }
   const pct = Number(els.power.value);
-  const phiDeg = ((state.aimPhi * 180) / Math.PI + 360) % 360;
+  // Step 10: the live (smoothed) aim drives the stroke, not the last target
+  const aim = game && typeof game.currentAim === 'function'
+    ? game.currentAim()
+    : state.aimPhi;
+  const phiDeg = ((aim * 180) / Math.PI + 360) % 360;
   const payload = { type: 'shot', v0: powerToV0(pct), phi: phiDeg };
   if (!els.callRow.hidden) {
     payload.ball_call = els.callBall.value;
     payload.pocket_call = els.callPocket.value;
   }
+  // Step 10 (A2): payload dump — the exact stroke on the wire, correlated
+  // with the server's "shot #N accepted" log line.
+  console.info('[pyramid] sending shot', JSON.stringify(payload));
   state.ws.send(JSON.stringify(payload));
   state.shotInFlight = true;
+  state.shotSentAt = Date.now();
+  state.charging = false;
+  // NOTE: setCueCharge(null) is deliberately NOT called here —
+  // playCueStrike below consumes the charged pull so the lunge launches
+  // from the dragged-back position.
   updateControls();
-  // Optimistic local feedback (Step 7): the cue stick lunges NOW; the balls
-  // themselves animate from the authoritative server keyframes when the
-  // result arrives.
+  // Optimistic local feedback (Step 7): the cue stick lunges NOW (from the
+  // charged position when charging); the balls themselves animate from the
+  // authoritative server keyframes when the result arrives.
   if (game && typeof game.playCueStrike === 'function') {
-    game.playCueStrike(state.aimPhi);
+    game.playCueStrike(aim);
   }
   startSimTicker();
+  armShotWatchdog();
 }
 
 function sendPlaceCue(x, y) {
@@ -581,6 +698,12 @@ function onMessage(msg) {
       els.game.hidden = true;
       els.room.hidden = false;
       renderRoom();
+      console.info('[pyramid] joined room', msg.room, 'as', msg.player_id);
+      if (state.practicePending) {
+        // Instant solo entry: the room exists, start the practice session.
+        state.practicePending = false;
+        state.ws.send(JSON.stringify({ type: 'practice' }));
+      }
       break;
     case 'player_list':
       state.players = msg.players;
@@ -590,6 +713,7 @@ function onMessage(msg) {
     case 'game_started': {
       state.started = true;
       state.mode = msg.mode || state.mode;
+      state.practice = Boolean(msg.practice);
       setGame(msg.game || null);
       state.pendingCue = null;
       state.balls = msg.balls || state.balls;
@@ -607,15 +731,42 @@ function onMessage(msg) {
         state.aimPhi = Math.PI / 2;
         game.setAim(state.aimPhi);
       }
-      els.gameText.textContent =
-        `Game started — ${msg.mode_name} — ` +
-        `${msg.players.map((p) => p.name).join(' vs ')}.`;
+      els.gameText.textContent = state.practice
+        ? `Practice mode («Тренировка») — solo session. Miss nothing, the table is yours.`
+        : `Game started — ${msg.mode_name} — `
+          + `${msg.players.map((p) => p.name).join(' vs ')}.`;
       buildCamButtons();
       applyGameState();
       startHudClock();
       break;
     }
+    case 'shot_ack': {
+      // Step 10: the server accepted the stroke — distinguish "lost message"
+      // from "still simulating" for the watchdog and the player.
+      console.info(`[pyramid] shot_ack #${msg.shot_id}`);
+      if (state.shotInFlight) {
+        els.gameHint.textContent = 'Server received the shot — simulating…';
+      }
+      break;
+    }
+    case 'engine_status': {
+      // Step 10: cold-start warning broadcast while the engine JIT-warms.
+      console.warn('[pyramid] engine_status', msg);
+      showToast(msg.message || 'Engine warming up…');
+      if (state.shotInFlight) els.gameHint.textContent = msg.message || '';
+      break;
+    }
     case 'shot_result': {
+      disarmShotWatchdog();
+      console.info('[pyramid] shot_result', {
+        shot_id: msg.shot_id,
+        legal: msg.legal,
+        reason: msg.reason,
+        pocketed: msg.pocketed,
+        sim_ms: msg.sim_ms,
+        kf_stats: msg.kf_stats,
+        latency_ms: state.shotSentAt ? Date.now() - state.shotSentAt : null,
+      });
       if (msg.game) setGame(msg.game); // stamp captured at arrival, applied later
       state.balls = msg.balls;
       els.gameText.textContent = verdictText(msg);
@@ -635,9 +786,17 @@ function onMessage(msg) {
         applyGameState();
       };
       if (game && msg.keyframes) {
-        const played = game.playKeyframes(msg.keyframes, applyAfter);
-        if (played && !game.isAnimating()) {
-          applyAfter(); // hidden-tab fast path already finished
+        // Step 10: an animation failure must never strand the UI — snap to
+        // the authoritative state instead (the old code left the shooter at
+        // "Simulating…" forever when playKeyframes returned false/threw).
+        let played = false;
+        try {
+          played = game.playKeyframes(msg.keyframes, applyAfter);
+        } catch (err) {
+          console.error('[pyramid] keyframe animation failed — snapping', err);
+        }
+        if (!played || !game.isAnimating()) {
+          applyAfter(); // no animation / hidden-tab fast path already finished
         }
       } else {
         applyAfter();
@@ -663,19 +822,31 @@ function onMessage(msg) {
       state.pendingCue = null;
       state.lastTurnId = null;
       state.chipEls = null;
+      state.practice = false;
+      disarmShotWatchdog();
       stopSimTicker();
       stopHudClock();
       els.hud.hidden = true;
       els.lobby.classList.remove('playing');
       PYRAMID()?.setBallInHand('none');
+      PYRAMID()?.setCueCharge(null);
+      state.charging = false;
       els.game.hidden = true;
       els.gameOver.hidden = true;
       els.room.hidden = false;
       renderRoom();
       break;
     case 'error':
+      // Step 10 (A2): server errors are shown where the player IS — the
+      // toast + game hint — not only in the lobby entry's hidden msg line.
+      console.error('[pyramid] server error', msg);
       showMsg(`${msg.message} (${msg.code})`);
+      showToast(msg.message || 'Server error');
+      if (state.started) {
+        els.gameHint.textContent = `⚠ ${msg.message}`;
+      }
       state.shotInFlight = false;
+      disarmShotWatchdog();
       stopSimTicker();
       updateControls();
       break;
@@ -707,13 +878,16 @@ function renderRoom() {
     ? 'You pick the game mode.'
     : `Host picks the mode — currently ${MODE_NAMES[state.mode] || state.mode}.`;
 
+  // Step 10: practice entry — host-only, available at any room size.
+  els.practice.hidden = !isHostPlayer;
   if (!isHostPlayer) {
     els.start.hidden = true;
     els.hint.textContent = 'Waiting for the host to start the game…';
   } else if (count < 2) {
     els.start.hidden = false;
     els.start.disabled = true;
-    els.hint.textContent = 'Waiting for a second player… share the room code!';
+    els.hint.textContent =
+      'Waiting for a second player… share the code, or start Practice mode!';
   } else {
     els.start.hidden = false;
     els.start.disabled = false;
@@ -744,11 +918,18 @@ function resetToEntry() {
   state.pendingCue = null;
   state.lastTurnId = null;
   state.chipEls = null;
+  state.practice = false;
+  state.practicePending = false;
+  state.charging = false;
+  disarmShotWatchdog();
   stopSimTicker();
   stopHudClock();
   els.hud.hidden = true;
   els.toast.hidden = true;
   els.lobby.classList.remove('playing');
+  PYRAMID()?.setCueCharge(null);
+  PYRAMID()?.setPlayerControl(false);
+  PYRAMID()?.setCueCamFollow(false);
   els.room.hidden = true;
   els.game.hidden = true;
   els.gameOver.hidden = true;
@@ -771,6 +952,16 @@ els.rematch.addEventListener('click', () => {
   }
 });
 
+// Step 10: practice entries — lobby entry button (instant solo room) and
+// the in-game Re-rack control (same message; the server re-racks).
+els.practice.addEventListener('click', startPractice);
+els.rerack.addEventListener('click', () => {
+  if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+    els.rerack.disabled = true;
+    state.ws.send(JSON.stringify({ type: 'practice' }));
+  }
+});
+
 els.modeGrid.addEventListener('click', (ev) => {
   const btn = ev.target.closest('.mode-btn');
   if (!btn || btn.disabled) return;
@@ -785,13 +976,136 @@ els.placeCue.addEventListener('click', () => {
   updateControls();
 });
 
-// aim (not drag) on the table: with ball-in-hand the click places the cue
-// ball; otherwise it sets the cue direction from the cue ball to the point
+// --- Step 10: Panda3D-style aiming input state machine ---------------------------
+// mousemove (no buttons)  -> the aim sweeps toward the cursor's table point
+//                            (smoothed per render frame in main.js)
+// LMB press-drag          -> power charge: vertical pull maps 1..100 %, the
+//                            stick pulls back visually, release under 2 %
+//                            cancels, any other release shoots the live aim
+// RIGHT-drag / wheel      -> camera orbit/zoom (target lerps onto the cue
+//                            ball during your turn — main.js)
+// touch one-finger drag   -> aim; two fingers -> camera; slider + Shoot fire
+// click (tap, no drag)    -> ball-in-hand cue placement (when placingCue)
+// Esc                     -> cancel the charge
+const sceneEl = document.getElementById('scene');
+
+sceneEl.addEventListener('contextmenu', (ev) => ev.preventDefault());
+
+// CAPTURE phase at document level: the charge start must reach the canvas
+// BEFORE OrbitControls' own listener (same element) — stopping propagation
+// here keeps OrbitControls completely unaware of power-charge drags.
+document.addEventListener(
+  'pointerdown',
+  (ev) => {
+    if (ev.target !== sceneEl || ev.button !== 0) return;
+    if (ev.pointerType === 'touch') return; // touch aims via one-finger drag
+    if (!state.started) return;
+    const game = PYRAMID();
+    if (!game || game.isAnimating() || state.shotInFlight) return;
+    if (!myTurn() || state.placingCue) return; // camera / placement own the click
+    ev.stopPropagation();
+    try {
+      sceneEl.setPointerCapture(ev.pointerId);
+    } catch {
+      /* capture is best-effort; the move/up handlers still work */
+    }
+    state.charging = true;
+    state.chargeStartY = ev.clientY;
+    state.chargeStartPct = Number(els.power.value);
+    console.debug('[pyramid] charge start at', state.chargeStartPct, '%');
+  },
+  true,
+);
+
+sceneEl.addEventListener('pointermove', (ev) => {
+  if (!state.started) return;
+  const game = PYRAMID();
+  if (!game || game.isAnimating() || state.shotInFlight) return;
+
+  if (state.charging) {
+    // pull DOWN the cue (downwards drag) to charge; the slider stays synced
+    const dy = ev.clientY - state.chargeStartY;
+    const pct = Math.max(
+      1,
+      Math.min(100, Math.round(state.chargeStartPct + dy * 0.35)),
+    );
+    els.power.value = String(pct);
+    els.powerVal.textContent = `${pct}%`;
+    if (typeof game.setCueCharge === 'function') game.setCueCharge(pct);
+    return;
+  }
+
+  if (ev.pointerType === 'touch') {
+    // one-finger drag aims (two-finger camera gestures reach OrbitControls)
+    if (!ev.isPrimary || !myTurn() || state.placingCue) return;
+    const hit = game.tablePoint(ev.clientX, ev.clientY);
+    if (!hit) return;
+    const balls = game.ballPositions();
+    const cue = balls && balls.cue;
+    if (!cue) return;
+    state.aimPhi = aimPhiTo(hit, cue);
+    game.setAimTarget(state.aimPhi);
+    return;
+  }
+
+  if (ev.buttons !== 0) return; // camera drag — never re-aims
+  if (state.placingCue || !myTurn()) return;
+  const hit = game.tablePoint(ev.clientX, ev.clientY);
+  if (!hit) return;
+  const balls = game.ballPositions();
+  const cue = balls && balls.cue;
+  if (!cue) return;
+  state.aimPhi = aimPhiTo(hit, cue);
+  game.setAimTarget(state.aimPhi);
+});
+
+// world/queue mapping: scene hit point + cue ball world pos -> pooltool phi
+function aimPhiTo(hit, cue) {
+  // world (mesh.position.x/z) -> pooltool (x = z + W/2, y = x + L/2)
+  const cueX = cue.z + 1.8 / 2;
+  const cueY = cue.x + 3.7 / 2;
+  const phi = Math.atan2(hit.y - cueY, hit.x - cueX);
+  return (phi + Math.PI * 2) % (Math.PI * 2);
+}
+
+function endCharge(ev) {
+  if (!state.charging) return;
+  state.charging = false;
+  const game = PYRAMID();
+  const pulled = Math.abs(ev.clientY - state.chargeStartY);
+  const pct = Number(els.power.value);
+  if (pulled < 6 || pct < 2) {
+    // cancel: re-seat the stick (a tap or a micro-jolt must not fire)
+    if (game && typeof game.setCueCharge === 'function') game.setCueCharge(null);
+    console.debug('[pyramid] charge cancelled', { pulled, pct });
+    updateControls();
+    return;
+  }
+  sendShot(); // playCueStrike inside consumes the charged pull
+}
+
+sceneEl.addEventListener('pointerup', endCharge);
+sceneEl.addEventListener('pointercancel', () => {
+  if (!state.charging) return;
+  state.charging = false;
+  PYRAMID()?.setCueCharge(null);
+  updateControls();
+});
+
+// Esc cancels an in-progress charge
+document.addEventListener('keydown', (ev) => {
+  if (ev.key !== 'Escape' || !state.charging) return;
+  state.charging = false;
+  PYRAMID()?.setCueCharge(null);
+  updateControls();
+});
+
+// ball-in-hand placement: a genuine click (not a camera drag) on the felt
 let downPos = null;
-document.getElementById('scene').addEventListener('pointerdown', (ev) => {
+sceneEl.addEventListener('pointerdown', (ev) => {
   downPos = [ev.clientX, ev.clientY];
 });
-document.getElementById('scene').addEventListener('click', (ev) => {
+sceneEl.addEventListener('click', (ev) => {
   if (!state.started) return;
   if (downPos) {
     const dx = ev.clientX - downPos[0];
@@ -801,21 +1115,9 @@ document.getElementById('scene').addEventListener('click', (ev) => {
   }
   const game = PYRAMID();
   if (!game || game.isAnimating() || state.shotInFlight) return;
+  if (!(state.placingCue && myTurn())) return; // aiming moved to pointermove
   const hit = game.tablePoint(ev.clientX, ev.clientY);
-  if (!hit) return;
-  if (state.placingCue && myTurn()) {
-    sendPlaceCue(hit.x, hit.y);
-    return;
-  }
-  const balls = game.ballPositions();
-  const cue = balls && balls.cue;
-  if (!cue) return;
-  // world (mesh.position.x/z) -> pooltool (x = z + W/2, y = x + L/2)
-  const cueX = cue.z + 1.8 / 2;
-  const cueY = cue.x + 3.7 / 2;
-  const phi = Math.atan2(hit.y - cueY, hit.x - cueX);
-  state.aimPhi = (phi + Math.PI * 2) % (Math.PI * 2);
-  game.setAim(state.aimPhi);
+  if (hit) sendPlaceCue(hit.x, hit.y);
 });
 
 els.power.addEventListener('input', () => {

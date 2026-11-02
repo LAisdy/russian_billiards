@@ -60,6 +60,12 @@
         <input id="lobby-code" maxlength="4" placeholder="ABCD" autocomplete="off" spellcheck="false">
 
         <button id="btn-join" class="lobby-btn lobby-btn-secondary">Join room</button>
+
+        <div class="lobby-or">— or play alone —</div>
+
+        <button id="btn-practice" class="lobby-btn lobby-btn-secondary">
+          Practice mode («Тренировка»)
+        </button>
       </div>
 
       <div id="lobby-room" hidden>
@@ -125,7 +131,10 @@
             <button id="btn-place-cue" class="lobby-btn lobby-btn-secondary" hidden>
               Placing cue ball: on
             </button>
-            <div id="game-hint">Click the table to aim, then shoot.</div>
+            <button id="btn-rerack" class="lobby-btn lobby-btn-secondary" hidden>
+              Re-rack
+            </button>
+            <div id="game-hint">Move the mouse to aim, then shoot.</div>
           </div>
           <div id="game-over" hidden>
             <div id="game-over-text"></div>

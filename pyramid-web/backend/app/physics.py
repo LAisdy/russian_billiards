@@ -80,6 +80,11 @@ DEFAULT_A = 0.0
 DEFAULT_B = 0.25
 DEFAULT_THETA = 0.0
 
+#: Motion-state names counting as "on the table" (Step 10: the practice-mode
+#: post-processing in app/lobby.py filters the raw simulation output on these
+#: plain strings instead of touching the vendored constants directly).
+ON_TABLE_STATES = frozenset(const.state_dict[s] for s in const.on_table)
+
 # layouts.get_rack() draws from the *global* `random` / `numpy.random` pools
 # (the library's public entry point does not forward a seed), so rack
 # generation is serialized and explicitly seeded.
@@ -429,6 +434,10 @@ def run_shot_keyframes(
         "duration_ms": round(duration_s * 1000),
         "frames": frames,
         "events": events,
+        # Step 10 (A4): the client's finishAnimation hides these ids when the
+        # animation completes — without this key the field defaulted to []
+        # and potted ball meshes stayed visible at the pocket mouth.
+        "pocketed": pocketed,
     }
     kf_stats = {
         "frames": len(frames),
@@ -529,13 +538,16 @@ def respot_cue_position(balls: dict[str, tuple[float, float]]) -> tuple[float, f
 
 
 def warmup() -> None:
-    """Compile the numba kernels (2D example + full 3D Russian break) in a
-    background thread so the first real request is not billed seconds of JIT.
+    """Compile the numba kernels (2D example + full 3D Russian break + the
+    keyframe interpolation path) in a background thread so the first real
+    request is not billed seconds of JIT.
 
     Mirrors the desktop app's startup strategy (see pooltool PROGRESS.md:
     "full-rack JIT warmup"): System.example() covers the 2D/shared kernels,
     then a seeded 3D break compiles every hot 3D path with a realistic event
-    mix (~25 s total; steady-state shots are 75-190 ms).
+    mix, and a keyframe-format stroke compiles the interpolation machinery
+    the wire payload uses (Step 10: the web game's shot path must never pay
+    JIT inside a request). ~25-30 s total; steady-state shots are 75-190 ms.
     """
     if _warmup_state["started"]:
         return
@@ -549,10 +561,19 @@ def warmup() -> None:
             v0=3.0,
             phi=90.0,
         )
+        # Step 10 (A2): compile the keyframe/interpolation path too — it is
+        # the ONLY shot format the web game uses, and before this warmup it
+        # still JIT-compiled inside the first real request.
+        kf_shot = run_shot_keyframes(
+            {bid: (pos["x"], pos["y"]) for bid, pos in rack.items()},
+            v0=2.0,
+            phi=60.0,
+        )
         _warmup_state["ready"] = True
         print(
             f"[physics] warmup complete in {time.perf_counter() - start:.1f}s "
-            f"({shot['events']} events, pocketed={shot['pocketed']})",
+            f"({shot['events']} events, pocketed={shot['pocketed']}; "
+            f"keyframe path: {len(kf_shot['keyframes']['frames'])} frames)",
             flush=True,
         )
     except Exception:

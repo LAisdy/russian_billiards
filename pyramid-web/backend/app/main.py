@@ -73,7 +73,18 @@ from .physics import PhysicsError
 logger = logging.getLogger(__name__)
 
 APP_NAME = "pyramid-web-backend"
-VERSION = "0.7.0"
+VERSION = "0.8.0"
+
+# Step 10 (A1): app-level logs (shot lifecycle, lobby events) must reach the
+# platform console — uvicorn configures only its own loggers, so without a
+# root handler every logger.info() used to vanish (render.com field report:
+# silent shot failures). Idempotent: skips when the deployment pre-configured
+# logging. PYRAMID_LOG_LEVEL overrides (e.g. DEBUG for message-level traces).
+if not logging.getLogger().handlers:
+    logging.basicConfig(
+        level=os.environ.get("PYRAMID_LOG_LEVEL", "INFO").upper(),
+        format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
+    )
 
 
 @asynccontextmanager
@@ -282,6 +293,7 @@ async def _reply(ws: WebSocket, payload: dict) -> None:
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket) -> None:
     await ws.accept()
+    logger.info("ws connected (%s)", ws.client.host if ws.client else "unknown")
     session: Session | None = None
     try:
         # Handshake: the first message must create or join a room.
@@ -316,7 +328,7 @@ async def ws_endpoint(ws: WebSocket) -> None:
                     {"type": "error", "code": exc.code, "message": exc.message},
                 )
 
-        # In-room loop: start_game / ping / ...
+        # In-room loop: start_game / ping / shot / ...
         while True:
             msg = await _recv(ws)
             if msg is None:
@@ -331,6 +343,7 @@ async def ws_endpoint(ws: WebSocket) -> None:
                     },
                 )
                 continue
+            logger.debug("ws message room=%s type=%r", session.room.code, msg.get("type"))
             try:
                 await manager.handle(session, msg)
             except LobbyError as exc:
@@ -338,8 +351,30 @@ async def ws_endpoint(ws: WebSocket) -> None:
                     ws,
                     {"type": "error", "code": exc.code, "message": exc.message},
                 )
+            except Exception:
+                # Step 10 (A1): a non-lobby bug used to kill this socket's
+                # receive loop silently — the shooter stayed at "Simulating…"
+                # forever while the opponent never learned why. Log loudly,
+                # tell the client, KEEP THE LOOP ALIVE.
+                logger.exception(
+                    "unhandled error handling %r in room %s",
+                    msg.get("type"), session.room.code,
+                )
+                await _reply(
+                    ws,
+                    {
+                        "type": "error",
+                        "code": "internal_error",
+                        "message": "internal error — the request could not be "
+                        "processed (see server logs)",
+                    },
+                )
     finally:
         if session is not None:
+            logger.info(
+                "ws disconnecting room=%s player=%s",
+                session.room.code, session.player.name,
+            )
             await manager.leave(session)
 
 

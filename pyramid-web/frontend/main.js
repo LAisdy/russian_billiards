@@ -750,17 +750,28 @@ const aimLine = (() => {
   return line;
 })();
 
-const setAim = (phiRad) => {
+// --- Step 10: smoothed aim (Panda3D-style sweep) --------------------------------
+// The cue direction is a smoothly-approached TARGET, not a snap: lobby.js
+// feeds aim targets (mouse hover over the felt), and every rendered frame
+// eases the live angle toward it (exponential, frame-rate independent).
+// setAim() stays the INSTANT variant (game start / cue placement / test
+// hooks); setAimTarget() requests the sweep used by the live aiming UX.
+let aimCur = Math.PI / 2; // live angle driving stick + aim line
+let aimTgt = Math.PI / 2; // requested angle
+const AIM_SMOOTH_PER_S = 14; // higher = snappier sweep
+const CUE_CHARGE_TRAVEL = 0.35; // extra stick pull at 100 % charge (m)
+let chargePct = null; // null = not charging (power-charge visual, Step 10)
+
+const shortestArc = (d) =>
+  (((d + Math.PI) % (2 * Math.PI)) + 2 * Math.PI) % (2 * Math.PI) - Math.PI;
+
+const redrawAim = () => {
   const cue = ballMeshes.get('cue');
-  if (!cue || phiRad === null || phiRad === undefined || animState) {
-    aimLine.visible = false;
-    if (!strikeState) cueStick.visible = false; // never kill a live strike
-    return;
-  }
+  if (!cue || animState) return;
   const p = cue.position;
   // pooltool direction (cos φ, sin φ) in (x, y) -> world (X = y, Z = x)
-  const dX = Math.sin(phiRad);
-  const dZ = Math.cos(phiRad);
+  const dX = Math.sin(aimCur);
+  const dZ = Math.cos(aimCur);
   const pos = aimLine.geometry.attributes.position;
   const len = 1.1;
   pos.setXYZ(0, p.x, 0.004, p.z);
@@ -769,9 +780,63 @@ const setAim = (phiRad) => {
   aimLine.visible = true;
   if (!strikeState) {
     cueStick.visible = true;
-    placeStick(phiRad, CUE_REST_PULLBACK);
+    placeStick(
+      aimCur,
+      CUE_REST_PULLBACK +
+        (chargePct !== null ? (chargePct / 100) * CUE_CHARGE_TRAVEL : 0),
+    );
   }
 };
+
+// per-frame aim easing; also repaints while charging (stick pull follows)
+const stepAim = (dtMs) => {
+  if (animState) return;
+  if (chargePct !== null) {
+    redrawAim();
+    return;
+  }
+  const d = shortestArc(aimTgt - aimCur);
+  if (Math.abs(d) < 1e-4) {
+    if (aimCur !== aimTgt) {
+      aimCur = aimTgt;
+      redrawAim();
+    }
+    return;
+  }
+  aimCur =
+    (aimCur + d * (1 - Math.exp(-AIM_SMOOTH_PER_S * (dtMs / 1000))) +
+      2 * Math.PI) %
+    (2 * Math.PI);
+  redrawAim();
+};
+
+const setAim = (phiRad) => {
+  if (phiRad === null || phiRad === undefined || animState) {
+    aimLine.visible = false;
+    if (!strikeState) cueStick.visible = false; // never kill a live strike
+    return;
+  }
+  aimTgt = aimCur = ((phiRad % (2 * Math.PI)) + 2 * Math.PI) % (2 * Math.PI);
+  redrawAim();
+};
+
+const setAimTarget = (phiRad) => {
+  if (phiRad === null || phiRad === undefined || animState) return;
+  aimTgt = ((phiRad % (2 * Math.PI)) + 2 * Math.PI) % (2 * Math.PI);
+};
+
+// power-charge visual: the stick pulls back (and re-seats) with the drag
+const setCueCharge = (pct) => {
+  chargePct =
+    pct === null || pct === undefined
+      ? null
+      : Math.max(0, Math.min(100, Number(pct) || 0));
+  if (animState) return;
+  if (chargePct !== null) redrawAim();
+  else if (!strikeState) placeStick(aimCur, CUE_REST_PULLBACK);
+};
+
+const currentAim = () => aimCur;
 
 // --- cue stick: aim visual + optimistic strike feedback (Step 7) ----------------
 // The stroke itself stays server-authoritative (keyframes animate the real
@@ -830,11 +895,17 @@ const placeStick = (phiRad, pullback) => {
 
 const playCueStrike = (phiRad) => {
   if (!ballMeshes.get('cue')) return false;
-  strikeState = { t0: performance.now(), phi: phiRad };
+  // launch the lunge from wherever the stick currently is (a charged drag
+  // sweeps into the ball from the pulled-back position)
+  const startPull =
+    CUE_REST_PULLBACK +
+    (chargePct !== null ? (chargePct / 100) * CUE_CHARGE_TRAVEL : 0);
+  chargePct = null;
+  strikeState = { t0: performance.now(), phi: phiRad, startPull };
   cueStick.children[0].material.opacity = 0.96; // reset after a previous fade
   cueStick.children[1].material.opacity = 0.96;
   cueStick.visible = true;
-  placeStick(phiRad, CUE_REST_PULLBACK);
+  placeStick(phiRad, startPull);
   return true;
 };
 
@@ -848,7 +919,7 @@ const stepCueStrike = () => {
   }
   if (t <= STRIKE_LUNGE_MS) {
     const u = t / STRIKE_LUNGE_MS;
-    placeStick(s.phi, CUE_REST_PULLBACK * (1 - u * u)); // accelerate into contact
+    placeStick(s.phi, s.startPull * (1 - u * u)); // accelerate into contact
   } else {
     // follow-through past contact + fade out
     const v = (t - STRIKE_LUNGE_MS) / STRIKE_FADE_MS;
@@ -1069,6 +1140,25 @@ const stepCamTween = () => {
 // user grabs the camera mid-tween -> the tween loses immediately
 controls.addEventListener('start', cancelCamTween);
 
+// --- Step 10: player-control switching + cue-ball camera follow -----------------
+// While it is the player's turn the LEFT button is reserved for the power
+// charge (lobby.js) and one-finger touch aims — so the camera orbit moves to
+// the RIGHT button (mouse) / two fingers (touch); the wheel keeps zooming.
+// The orbit target also drifts (lerped) onto the cue ball, so orbiting
+// inspects the actual stroke position ("camera orbits the cue ball"). Any
+// camera preset button re-frames and the follow re-centers from there.
+controls.mouseButtons.RIGHT = THREE.MOUSE.ROTATE;
+let cueCamFollow = false;
+
+const setPlayerControl = (on) => {
+  controls.mouseButtons.LEFT = on ? -1 : THREE.MOUSE.ROTATE;
+  controls.touches.ONE = on ? -1 : THREE.TOUCH.ROTATE;
+};
+
+const setCueCamFollow = (on) => {
+  cueCamFollow = Boolean(on);
+};
+
 // re-frame the active preset on viewport changes (instant: a resize wants
 // the new framing NOW, not an animation); free-orbited views are untouched
 window.addEventListener('resize', () => {
@@ -1099,7 +1189,8 @@ fetch('/api/health')
   .then((resp) => resp.json())
   .then((data) => {
     document.getElementById('hud-backend').textContent =
-      `backend: ${data.status} · ${data.service} v${data.version}`;
+      `backend: ${data.status} · ${data.service} v${data.version} · ` +
+      `engine ${data.physics_ready ? 'ready' : 'warming'}`;
   })
   .catch(() => {
     document.getElementById('hud-backend').textContent = 'backend: unreachable';
@@ -1112,9 +1203,24 @@ window.addEventListener('resize', () => {
   renderer.setSize(window.innerWidth, window.innerHeight);
 });
 
+let lastFrameMs = performance.now();
 renderer.setAnimationLoop(() => {
+  const now = performance.now();
+  const dtMs = Math.min(100, now - lastFrameMs); // clamp tab-switch spikes
+  lastFrameMs = now;
   if (camTween) stepCamTween();
+  if (cueCamFollow && !camTween) {
+    const cue = ballMeshes.get('cue');
+    if (cue) {
+      const k = 1 - Math.exp(-6 * (dtMs / 1000));
+      controls.target.lerp(
+        new THREE.Vector3(cue.position.x, BALL_R, cue.position.z),
+        k,
+      );
+    }
+  }
   controls.update();
+  stepAim(dtMs);
   if (animState) stepAnimation();
   if (strikeState) stepCueStrike();
   renderer.render(scene, camera);
@@ -1229,6 +1335,11 @@ window.__pyramid = {
   playCueStrike,
   stickVisible: () => cueStick.visible,
   setAim,
+  setAimTarget,
+  currentAim,
+  setCueCharge,
+  setPlayerControl,
+  setCueCamFollow,
   tablePoint,
   showAllBalls,
   setBallInHand,

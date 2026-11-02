@@ -37,9 +37,15 @@ FROM python:3.12-slim AS runtime
 # so ONE container exposes UI + REST + WS on one origin — the single-service
 # deployment shape used on render.com. docker-compose keeps nginx in front
 # (its copy is authoritative there); serving the tree twice is harmless.
+# NUMBA_CPU_NAME=generic: the JIT disk cache is BAKED at build time (below),
+# and the build box's CPU is never the run fleet's CPU — a host-specific
+# compile could embed instructions the runtime CPU lacks. "generic" targets
+# baseline x86-64 (portable everywhere; the ~75-190 ms steady-state shot
+# budget tolerates the few-percent codegen cost).
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PYTHONHASHSEED=0 \
+    NUMBA_CPU_NAME=generic \
     PYRAMID_STATIC_DIR=/app/static \
     PATH="/opt/venv/bin:$PATH"
 
@@ -63,6 +69,20 @@ COPY --from=builder /opt/venv /opt/venv
 COPY backend/app ./app
 COPY backend/pooltool ./pooltool
 COPY frontend ./static
+
+# Step 10 (A3): BAKE the numba JIT disk cache into the image. .dockerignore
+# excludes **/__pycache__/** and **/*.nbc from the build context, so every
+# fresh container used to recompile the full 3D kernel set from scratch —
+# ~25 s on a fast box, potentially MINUTES on the free tier's throttled
+# shared CPU with 512 MB. A shot arriving before warmup finished blocked the
+# whole receive loop for that long ("cue disappears, balls never move, the
+# opponent's screen freezes" — the render.com field report). Running the
+# warmup here (as root, before chown/USER) writes the .nbc set next to the
+# vendored sources so containers start with a WARM engine; the chown below
+# keeps the cache directory writable for any later runtime recompiles. If
+# numba ever rejects the baked entries it silently recompiles — no worse
+# than before, and now observable via the shot lifecycle logs (A1).
+RUN /opt/venv/bin/python -c "from app import physics; physics.warmup(); assert physics.warm_ready(), 'JIT warmup did not reach ready state'"
 
 # Non-root runtime; /app is chowned so numba's JIT disk cache (written next
 # to the vendored sources) survives container restarts instead of silently
